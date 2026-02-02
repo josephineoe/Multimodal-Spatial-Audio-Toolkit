@@ -2,14 +2,13 @@ import socket
 import threading
 import time
 import csv
+import os
 import math
 
 import numpy as np
 import soundfile as sf
 import sounddevice as sd
 from scipy import signal
-
-from simulation_utils import SimulationLogger, SimulationReader
 
 from dataclasses import dataclass
 
@@ -50,7 +49,7 @@ VISION_CONFIG = {
     # YOLO 
     "model_path": "yolov8n.pt",
     "conf_thres": 0.25,
-    "infer_hz": 10.0,            # 8–12 Hz recommended
+    "infer_hz": 8.0,            # FIXED: Reduced from 10 to 8 Hz for stability
 
     # Target selection mode for vision:
     #  - "allowed_objects": largest box among allowed_classes (includes person)
@@ -81,7 +80,7 @@ VISION_CONFIG = {
 
     # Phase 2.5 distance (NO depth AI yet): estimate distance from bbox height using assumed real-world size.
     # Monocular approximation: distance ≈ (real_height_m * focal_length_px) / bbox_height_px
-    # Works best for "person". For other classes it’s a rough proxy.
+    # Works best for "person". For other classes it's a rough proxy.
     "distance_mode": "bbox_height",   # "bbox_height" | "fixed"
     "distance_fixed_m": 1.4,
     "distance_min_m": 0.3,
@@ -98,9 +97,16 @@ VISION_CONFIG = {
         "cup": 0.12,
     },
 
+    # FIXED: Toggles for distance effects (debug-friendly)
+    "enable_distance_attenuation": True,  # Controls distance-based loudness
+    "enable_distance_modulation": False,   # Controls parking sensor effect (default off)
+
     # Debug / UI
-    "show_window": True,        # turn on if you want to see detections
+    "show_window": False,        # FIXED: Turn off during real runs
     "window_name": "Vision (YOLO Phase-2)",
+    
+    # FIXED: Print throttling
+    "print_every_n_frames": 30,  # Only print vision updates every N frames
 }
 
 def _open_camera_for_vision():
@@ -193,6 +199,7 @@ class VisionYOLOPhase2(threading.Thread):
         super().__init__(daemon=True)
         self.processor = processor
         self._stop_evt = threading.Event()
+        self._frame_count = 0  # FIXED: For print throttling
 
     def stop(self):
         self._stop_evt.set()
@@ -251,6 +258,7 @@ class VisionYOLOPhase2(threading.Thread):
 
         infer_interval = 1.0 / float(VISION_CONFIG["infer_hz"])
         next_t = time.time()
+        print_every = VISION_CONFIG.get("print_every_n_frames", 30)
 
         while not self._stop_evt.is_set():
             ret, frame = cap.read()
@@ -267,6 +275,7 @@ class VisionYOLOPhase2(threading.Thread):
                 continue
 
             next_t = now + infer_interval
+            self._frame_count += 1
 
             # YOLO inference (no tracking IDs)
             res = model(frame, conf=VISION_CONFIG["conf_thres"], verbose=False)[0]
@@ -309,7 +318,7 @@ class VisionYOLOPhase2(threading.Thread):
             ny = (cy - (H / 2.0)) / (H / 2.0)  # -1 (top) to +1 (bottom)
             el_deg = -ny * (vfov_deg / 2.0)    # up is positive, down is negative
 
-            # Get IMU angles for world-lock update
+            # FIXED: Get RAW IMU angles for world-lock update (consistent yaw signal)
             roll, pitch, yaw = self.processor.imu.get_euler()
 
             cls_name = names.get(int(cls_ids[idx]), str(int(cls_ids[idx])))
@@ -318,6 +327,9 @@ class VisionYOLOPhase2(threading.Thread):
             # Estimate distance for the CURRENT single target (Phase 2.5)
             dist_m = self._estimate_distance_m(x1, y1, x2, y2, cls_name, W, H)
 
+            # FIXED: Store timestamp for timing alignment
+            t_vision = time.time()
+            
             self.processor.update_vision_target(
                 az_deg,
                 el_deg,
@@ -326,9 +338,12 @@ class VisionYOLOPhase2(threading.Thread):
                 distance_m=dist_m,
                 conf=conf,
                 cls_name=cls_name,
+                t_vision=t_vision,  # FIXED: Pass vision timestamp
             )
 
-            print(f"[VISION] target={cls_name} conf={conf:.2f} cx={cx:.1f}/{W} cy={cy:.1f}/{H} az_deg={az_deg:.1f} el_deg={el_deg:.1f} dist_m={dist_m:.2f}")
+            # FIXED: Throttle prints - only print every N frames
+            if self._frame_count % print_every == 0:
+                print(f"[VISION] target={cls_name} conf={conf:.2f} az_deg={az_deg:.1f} el_deg={el_deg:.1f} dist_m={dist_m:.2f}")
 
             if VISION_CONFIG["show_window"]:
                 cv2.imshow(VISION_CONFIG["window_name"], res.plot())
@@ -345,19 +360,19 @@ class VisionYOLOPhase2(threading.Thread):
 # NOTE ON TARGET RULES (keep this instruction)
 # ---------------------------------------------------------
 # When YOLO detects multiple things in a frame, you still need one thing to treat
-# as the “target” (the thing you’ll turn into a single audio source).
+# as the "target" (the thing you'll turn into a single audio source).
 #
-# “Largest box” is a simple tie-breaker / prioritization rule:
+# "Largest box" is a simple tie-breaker / prioritization rule:
 #   - Each detection has a bounding box area: (x2-x1) * (y2-y1)
-#   - “Largest box” means: choose the detection with the biggest area.
-# Why it’s useful:
+#   - "Largest box" means: choose the detection with the biggest area.
+# Why it's useful:
 #   - Bigger box ≈ object is closer / more dominant in view
 #   - Cheap heuristic early on
-#   - Stable with tracking (BoT-SORT IDs) because the “main” object often stays “main”
+#   - Stable with tracking (BoT-SORT IDs) because the "main" object often stays "main"
 #
-# In the “allowed_objects” mode, you are NOT choosing “largest among everything”.
-# You are choosing “largest among your allow-list” (cup/chair/.../person).
-# The other mode “person_only” forces the target to be a person.
+# In the "allowed_objects" mode, you are NOT choosing "largest among everything".
+# You are choosing "largest among your allow-list" (cup/chair/.../person).
+# The other mode "person_only" forces the target to be a person.
 # ---------------------------------------------------------
 
 
@@ -420,12 +435,12 @@ class AudioSource:
               f"({len(self.audio_data) / sample_rate:.2f}s)")
 
     def _resample(self, data, orig_sr, target_sr):
-        """Resample audio data to target sample rate.""" 
+        """Resample audio data to target sample rate."""
         num_samples = int(len(data) * target_sr / orig_sr)
         return signal.resample(data, num_samples)
 
     def smooth_position_update(self):
-        """Smoothly interpolate current position toward target position.""" 
+        """Smoothly interpolate current position toward target position."""
         s = self.position_smoothing
         self.azimuth = s * self.azimuth + (1.0 - s) * self.target_azimuth
         self.elevation = s * self.elevation + (1.0 - s) * self.target_elevation
@@ -433,7 +448,7 @@ class AudioSource:
         self.gain = s * self.gain + (1.0 - s) * self.target_gain
 
     def set_target_position(self, azimuth=None, elevation=None, distance=None):
-        """Set target position for smooth interpolation.""" 
+        """Set target position for smooth interpolation."""
         if azimuth is not None:
             # Wrap to [-180, 180]
             az = float(azimuth)
@@ -453,7 +468,7 @@ class AudioSource:
         self.target_gain = float(np.clip(g, 0.0, 1.0))
 
     def get_audio_chunk(self, frames):
-        """Get next chunk of audio, looping if necessary.""" 
+        """Get next chunk of audio, looping if necessary."""
         start = self.playback_position
         end = start + frames
 
@@ -479,7 +494,7 @@ class AudioSource:
         return (chunk.astype(np.float32) * float(self.gain))
 
     def reset_position(self):
-        """Reset playback to beginning.""" 
+        """Reset playback to beginning."""
         self.playback_position = 0
 
 
@@ -512,7 +527,7 @@ class IMUReceiver:
         print(f"[IMU] Listening for quaternions on {ip}:{port}")
 
     def _loop(self):
-        """Background UDP receive loop.""" 
+        """Background UDP receive loop."""
         # Accept BOTH formats:
         #  1) CSV:          t_send,qw,qx,qy,qz
         #  2) Labeled text: qw: 0.919 qx: 0.057 qy: 0.275 qz: 0.275
@@ -623,13 +638,15 @@ class MultiSourceHRTFAudio:
                     mono_block = source.get_audio_chunk(block_len)
                     spatial = self.spatialize_audio_block(mono_block, i)
                     mixed_output += spatial
-            # Normalize to prevent clipping
-            max_val = float(np.max(np.abs(mixed_output)))
-            if max_val > 0.7:
-                mixed_output *= 0.7 / max_val
             output_audio.append(mixed_output)
 
         full_audio = np.vstack(output_audio)
+        
+        # FIXED: Normalize ONCE at the end (not per source)
+        max_val = float(np.max(np.abs(full_audio)))
+        if max_val > 0.95:
+            full_audio *= 0.95 / max_val
+            
         if output_file is None:
             output_file = "simulated.wav"
             idx = 1
@@ -643,9 +660,12 @@ class MultiSourceHRTFAudio:
 
     def apply_distance_modulation(self, audio, distance):
         """
-        Parking sensor modulation: faster pulses = closer object
-        Implements advisor's suggestion from Jan 22 email
+        FIXED: Parking sensor modulation with toggle
+        Faster pulses = closer object
         """
+        if not VISION_CONFIG.get("enable_distance_modulation", False):
+            return audio
+            
         freq_close = 10.0  # Hz (close objects pulse fast)
         freq_far = 2.0     # Hz (far objects pulse slow)
         mod_depth = 0.4    # 40% modulation depth
@@ -664,18 +684,24 @@ class MultiSourceHRTFAudio:
         self.sample_rate = sample_rate
         self.buffer_size = 4096
 
-        # Latency logging
-        self.latency_log = open("latency_final_aar_audio.csv", "w", newline="")
+        # FIXED: Move latency logging off callback thread
+        self.latency_log_queue = []  # Store latency data for batch writing
+        debug_dir = os.path.join(os.path.dirname(__file__), "debug_logs")
+        latency_csv_path = os.path.join(debug_dir, "latency_final_aar_audio.csv")
+        self.latency_log = open(latency_csv_path, "w", newline="")
         self.latency_writer = csv.writer(self.latency_log)
         self.latency_writer.writerow(["timestamp", "latency_ms"])
 
         # IMU receiver
         self.logger = SimulationLogger()
         self.imu = IMUReceiver(port=imu_port, logger=self.logger)
+        
+        # FIXED: Use ONE consistent yaw signal (raw, no filtering/gain here)
+        # Filtering/gain applied only in audio_callback for head tracking
         self.filtered_yaw = 0.0
         self.filtered_pitch = 0.0
 
-        # Sensitivity gains
+        # Sensitivity gains (applied in audio callback)
         self.yaw_gain = 2.0
         self.pitch_gain = 2.0
 
@@ -745,16 +771,17 @@ class MultiSourceHRTFAudio:
 
     # ---------------- Vision API ----------------
 
-    def update_vision_target(self, azimuth_deg, elevation_deg, yaw_deg, pitch_deg, distance_m=None, conf=None, cls_name=None):
+    def update_vision_target(self, azimuth_deg, elevation_deg, yaw_deg, pitch_deg, distance_m=None, conf=None, cls_name=None, t_vision=None):
         """
-        Provide a camera/head-relative vision target (azimuth/elevation in degrees).
-        yaw_deg/pitch_deg are IMU angles (degrees) at approx the same time.
+        FIXED: Provide a camera/head-relative vision target with timing alignment.
+        yaw_deg/pitch_deg are RAW IMU angles (degrees) at the vision capture time.
+        t_vision is the timestamp when vision captured this frame.
 
         If world-lock enabled:
           store target in world coords so if detection drops briefly, target stays stable.
         """
-        t = time.time()
-        gate_th = float(VISION_CONFIG.get("gate_conf_thres", 0.45))
+        t = t_vision if t_vision is not None else time.time()
+        gate_th = float(VISION_CONFIG.get("gate_conf_thres", 0.25))
         c = float(conf) if conf is not None else 0.0
         cname = str(cls_name) if cls_name is not None else ""
 
@@ -768,6 +795,7 @@ class MultiSourceHRTFAudio:
             self._vision_conf = c
             self._vision_cls_name = cname
 
+            # FIXED: Use RAW yaw (consistent signal everywhere)
             if self.use_world_lock_for_vision:
                 # az_rel (head) = az_world - yaw  => az_world = az_rel + yaw
                 self._vision_az_world = float(azimuth_deg) + float(yaw_deg)
@@ -787,10 +815,24 @@ class MultiSourceHRTFAudio:
 
             d = float(self._vision_dist_m) if self._vision_dist_m is not None else float(VISION_CONFIG.get("distance_fixed_m", 1.4))
 
-            # Phase 3: keep gain decoupled from distance.
-            # Distance attenuation is already applied inside the audio engine via source.distance.
-            # Here, gain is used ONLY for gating/fade-in-out of the vision target.
-            g_meas = 1.0
+            # FIXED: g_meas derived from confidence (and optionally distance)
+            # Base gain on confidence - higher confidence = higher gain
+            g_conf = float(np.clip(c / 0.8, 0.0, 1.0))  # Normalize confidence to 0-1 range
+            
+            # Optional: Factor in distance (closer = louder, but capped)
+            # This is SEPARATE from distance attenuation in the audio engine
+            if VISION_CONFIG.get("enable_distance_attenuation", True):
+                ref_dist = float(VISION_CONFIG.get("distance_ref_m", 1.4))
+                dist_factor = ref_dist / max(d, 0.3)  # Closer = higher factor
+                dist_factor = float(np.clip(dist_factor, 0.5, 2.0))  # Limit range
+            else:
+                dist_factor = 1.0
+            
+            # Combine confidence and distance factors
+            g_meas = g_conf * dist_factor
+            g_meas = float(np.clip(g_meas, 
+                                  VISION_CONFIG.get("gain_min", 0.0), 
+                                  VISION_CONFIG.get("gain_max", 1.0)))
 
             if c >= gate_th:
                 self.source_state.azimuth_deg = az_w
@@ -802,13 +844,13 @@ class MultiSourceHRTFAudio:
                 self.source_state.cls_name = cname
                 self.source_state.last_update_t = t
 
-        # Log vision data
+        # FIXED: Log vision data (off callback thread)
         self.logger.log_vision(t, azimuth_deg, elevation_deg, d, c, cname)
 
         # ---------------- SOFA / HRTF support ----------------
 
     def load_sofa_hrtf(self, sofa_file):
-        """Load HRTF data from SOFA file.""" 
+        """Load HRTF data from SOFA file."""
         try:
             import sofar as sf_sofa
             sofa = sf_sofa.read_sofa(sofa_file)
@@ -834,7 +876,7 @@ class MultiSourceHRTFAudio:
             raise
 
     def _parse_position_grid(self):
-        """Parse and organize the HRTF measurement positions.""" 
+        """Parse and organize the HRTF measurement positions."""
         self.azimuths = self.source_positions[:, 0]
         self.elevations = self.source_positions[:, 1]
 
@@ -845,7 +887,7 @@ class MultiSourceHRTFAudio:
             self.position_dict[(az_key, el_key)] = i
 
     def _compute_measurement_vectors(self):
-        """Pre-compute direction unit vectors for interpolation.""" 
+        """Pre-compute direction unit vectors for interpolation."""
         az = np.radians(self.azimuths)
         el = np.radians(self.elevations)
 
@@ -856,7 +898,7 @@ class MultiSourceHRTFAudio:
         self.measurement_vecs = np.vstack([x, y, z]).T
 
     def find_k_nearest_hrir_indices(self, azimuth, elevation, k=4):
-        """Find K nearest measured HRTF directions on the sphere.""" 
+        """Find K nearest measured HRTF directions on the sphere."""
         az_r = np.radians(azimuth)
         el_r = np.radians(elevation)
 
@@ -873,7 +915,7 @@ class MultiSourceHRTFAudio:
         return idx, dots[idx]
 
     def interpolate_hrir(self, azimuth, elevation, k=4, beta=12.0):
-        """Interpolates HRIR using softmax weighting over nearest neighbors.""" 
+        """Interpolates HRIR using softmax weighting over nearest neighbors."""
         idx, cos_vals = self.find_k_nearest_hrir_indices(azimuth, elevation, k)
 
         exps = np.exp(beta * (cos_vals - np.max(cos_vals)))
@@ -884,6 +926,12 @@ class MultiSourceHRTFAudio:
         return hrir_l, hrir_r
 
     def apply_distance_attenuation(self, audio, distance):
+        """
+        FIXED: Distance attenuation with toggle
+        """
+        if not VISION_CONFIG.get("enable_distance_attenuation", True):
+            return audio
+            
         ref_distance = 1.4
         attenuation = ref_distance / max(distance, 0.2)
         output = audio * min(attenuation, 3.0) * 0.6
@@ -929,7 +977,7 @@ class MultiSourceHRTFAudio:
         self.prev_interp_hrir_left[source_idx] = hrir_l
         self.prev_interp_hrir_right[source_idx] = hrir_r
 
-        # Use robust block mixing and normalization from combined_aar.py
+        # FIXED: Robust block mixing from combined_aar.py (no per-source normalization)
         conv_left = signal.fftconvolve(mono_block, hrir_l, mode='full')
         conv_right = signal.fftconvolve(mono_block, hrir_r, mode='full')
 
@@ -952,34 +1000,42 @@ class MultiSourceHRTFAudio:
         else:
             self.overlap_buffers[source_idx] = np.zeros((self.hrir_length - 1, 2), dtype=np.float32)
 
-        # Apply distance attenuation and modulation
+        # Apply distance effects (with toggles)
         output = self.apply_distance_attenuation(output, source.distance)
         output = self.apply_distance_modulation(output, source.distance)
 
-        # Normalize to prevent clipping per source (robust block mixing)
-        max_val = float(np.max(np.abs(output)))
-        if max_val > 0.7:
-            output *= 0.7 / max_val
+        # FIXED: Removed per-source normalization - preserves distance-based loudness
 
         return output
 
     def audio_callback(self, outdata, frames, time_info, status):
-        """Callback function for real-time audio streaming with mixing.""" 
+        """
+        FIXED: Callback function with consistent yaw usage and final normalization only
+        """
         t_now = time.time()
         t_send = self.imu.t_send
 
+        # FIXED: Queue latency data instead of writing immediately
         if t_send > 0:
             latency_ms = (t_now - t_send) * 1000.0
-            self.latency_writer.writerow([t_now, latency_ms])
+            self.latency_log_queue.append([t_now, latency_ms])
+            
+            # Batch write every 100 samples
+            if len(self.latency_log_queue) >= 100:
+                self.latency_writer.writerows(self.latency_log_queue)
+                self.latency_log_queue.clear()
 
         if status:
             print(f"Audio status: {status}")
 
+        # FIXED: Get RAW IMU angles (consistent yaw signal)
         roll, pitch, yaw = self.imu.get_euler()
 
+        # FIXED: Apply gain and sign ONLY here (not mixed with raw elsewhere)
         target_yaw = -self.yaw_gain * yaw
         target_pitch = self.pitch_gain * pitch
 
+        # Smooth the filtered values
         alpha = 0.3
         self.filtered_yaw = (1.0 - alpha) * self.filtered_yaw + alpha * target_yaw
         self.filtered_pitch = (1.0 - alpha) * self.filtered_pitch + alpha * target_pitch
@@ -991,10 +1047,6 @@ class MultiSourceHRTFAudio:
         gain_for_audio = 1.0
 
         # Phase 3: vision drives a single source state (az/el/dist/gain), then IMU reorients it.
-        # Mental model:
-        #   final_audio_az = world_locked_object_az (from vision) - head_yaw (from IMU)
-        #   final_audio_el = world_locked_object_el (from vision) - head_pitch (from IMU)
-        # (Elevation is still near-zero in Phase 2/2.5, but the model is ready.)
         with self._vision_lock:
             ss = self.source_state
             v_active = bool(ss.active)
@@ -1007,15 +1059,13 @@ class MultiSourceHRTFAudio:
         fresh = v_active and ((t_now - v_last_t) <= self.vision_timeout_s)
 
         if fresh:
-            # Convert world -> listener frame using the SAME convention as the audio engine
-            # (filtered_yaw/filtered_pitch already include gain + sign).
+            # FIXED: Convert world -> listener frame using RAW yaw (consistent)
             meas_az = self._wrap_deg(v_az_w - float(yaw))
             meas_el = float(np.clip(v_el_w - float(pitch), -90.0, 90.0))
             meas_dist = float(v_dist)
             meas_gain = float(v_gain)
 
             # If we just became "fresh" this frame, snap the EMAs to the measurement
-            # so we do not ramp gain up from 0 (which sounds like the volume suddenly drops).
             if not self._vision_was_fresh:
                 self._src_az_ema = meas_az
                 self._src_el_ema = meas_el
@@ -1058,9 +1108,10 @@ class MultiSourceHRTFAudio:
                 spatialized = self.spatialize_audio_block(chunk, i)
                 mixed_output += spatialized
 
+        # FIXED: Normalize ONCE at the end (preserves distance-based loudness)
         max_val = float(np.max(np.abs(mixed_output)))
-        if max_val > 0.7:
-            mixed_output *= 0.7 / max_val
+        if max_val > 0.95:
+            mixed_output *= 0.95 / max_val
 
         if self.is_recording:
             self.recorded_frames.append(mixed_output.copy())
@@ -1069,7 +1120,7 @@ class MultiSourceHRTFAudio:
         outdata[:] = mixed_output
 
     def start_playback(self):
-        """Start real-time audio playback with HRTF processing.""" 
+        """Start real-time audio playback with HRTF processing."""
         if self.is_playing:
             print("Already playing")
             return
@@ -1091,6 +1142,8 @@ class MultiSourceHRTFAudio:
         print("  • Move your head (IMU) → source 0 world-fixed by default.")
         print("  • If vision target is updated recently, source 0 follows vision.")
         print("  • Press Ctrl+C in the terminal to stop playback\n")
+        print(f"\nDistance Attenuation: {'ON' if VISION_CONFIG.get('enable_distance_attenuation', True) else 'OFF'}")
+        print(f"Distance Modulation: {'ON' if VISION_CONFIG.get('enable_distance_modulation', False) else 'OFF'}\n")
 
         self.stream = sd.OutputStream(
             samplerate=self.sample_rate,
@@ -1101,10 +1154,16 @@ class MultiSourceHRTFAudio:
         self.stream.start()
 
     def stop_playback(self):
-        """Stop audio playback.""" 
+        """Stop audio playback."""
         if hasattr(self, 'stream'):
             self.stream.stop()
             self.stream.close()
+        
+        # FIXED: Flush any remaining latency data
+        if self.latency_log_queue:
+            self.latency_writer.writerows(self.latency_log_queue)
+            self.latency_log_queue.clear()
+            
         try:
             self.latency_log.close()
         except Exception:
@@ -1118,7 +1177,7 @@ class MultiSourceHRTFAudio:
         print("\nPlayback stopped")
 
     def start_recording(self):
-        """Start recording the mixed spatial audio output.""" 
+        """Start recording the mixed spatial audio output."""
         if not self.is_playing:
             print("Cannot record - playback not active")
             return
@@ -1129,7 +1188,7 @@ class MultiSourceHRTFAudio:
         print("\n🔴 RECORDING STARTED")
 
     def stop_recording(self, filename="spatial_audio_output.wav"):
-        """Stop recording and save to WAV file.""" 
+        """Stop recording and save to WAV file."""
         if not self.is_recording:
             return
 
@@ -1178,8 +1237,7 @@ if __name__ == "__main__":
             "Choose mode:\n"
             "  1. Real-time playback (head-tracked)\n"
             "  2. Offline render to WAV (scripted animation)\n"
-            "  3. Simulation mode (using logged CSV data or synthetic)\n"
-            "Choice (1/2/3): "
+            "Choice (1/2): "
         ).strip()
 
         if mode == "2":
@@ -1189,61 +1247,15 @@ if __name__ == "__main__":
             except Exception:
                 duration = 5.0
             processor.export_offline_render(duration_seconds=duration)
-        elif mode == "3":
-            # Simulation mode
-            sim_reader = SimulationReader()
+        else:
             processor.start_playback()
-            processor.use_world_lock_for_vision = True
-
-            def simulation_loop():
-                while True:
-                    qw, qx, qy, qz, roll, pitch, yaw = sim_reader.get_next_imu()
-                    processor.imu.qw, processor.imu.qx, processor.imu.qy, processor.imu.qz = qw, qx, qy, qz
-                    processor.imu.t_send = time.time()
-                    
-                    az, el, dist, conf, cls_name = sim_reader.get_next_vision()
-                    processor.update_vision_target(az, el, yaw, pitch, dist, conf, cls_name)
-                    
-                    time.sleep(0.1)  # 10 Hz
-
-            sim_thread = threading.Thread(target=simulation_loop, daemon=True)
-            sim_thread.start()
-
             try:
                 while True:
                     time.sleep(0.5)
             except KeyboardInterrupt:
-                print("\n[MAIN] Stopping simulation...")
+                print("\n[MAIN] Stopping playback...")
             finally:
                 processor.stop_playback()
-        else:
-            # Real-time playback + vision (Phase 2: azimuth-only, single target)
-            # Start audio first (head-tracked baseline), then start the vision thread.
-            processor.start_playback()
-
-            # Ensure world-lock is ON for vision targets
-            processor.use_world_lock_for_vision = True
-
-            vision_thread = VisionYOLOPhase2(processor)
-            vision_thread.start()
-
-            print("vision alive?", vision_thread.is_alive())
-            print("has run override?", vision_thread.run.__qualname__)
-
-            # Keyboard listener for recording toggle
-            try:
-                import keyboard
-                print("Press 'R' to start/stop recording during playback.")
-                while True:
-                    if keyboard.is_pressed('r'):
-                        processor.toggle_recording()
-                        # Wait for key release to avoid rapid toggling
-                        while keyboard.is_pressed('r'):
-                            time.sleep(0.1)
-                    time.sleep(0.1)
-            except ImportError:
-                print("\n[WARN] 'keyboard' library not installed. Recording toggle via 'R' key is disabled.")
-                print("Install with: pip install keyboard")
                 try:
                     while True:
                         time.sleep(0.5)

@@ -553,7 +553,9 @@ class MultiSourceHRTFAudio:
         self.buffer_size = 4096
 
         # Latency logging
-        self.latency_log = open("latency_final_aar_audio.csv", "w", newline="")
+        debug_dir = os.path.join(os.path.dirname(__file__), "debug_logs")
+        latency_csv_path = os.path.join(debug_dir, "latency_final_aar_audio.csv")
+        self.latency_log = open(latency_csv_path, "w", newline="")
         self.latency_writer = csv.writer(self.latency_log)
         self.latency_writer.writerow(["timestamp", "latency_ms"])
 
@@ -985,7 +987,7 @@ if __name__ == "__main__":
     print("=" * 70)
 
     try:
-        audio_files = ["rain.wav"]
+        audio_files = ["rain.mp3"]
 
         processor = MultiSourceHRTFAudio(
             audio_files=audio_files,
