@@ -1147,7 +1147,7 @@ class SpatialAudioProcessor:
         print("  • Move your head (IMU) → source 0 world-fixed by default.")
         print("  • If vision target is updated recently, source 0 follows vision.")
         print("  • Press Ctrl+C in the terminal to stop playback\n")
-        print(f"\nDistance Attenuation: {'ON' if VISION_CONFIG.get('enable_distance_attenuation', True) else 'OFF'}")
+        print(f"\nDistance Attenuation: {'ON' if VISION_CONFIG.get('enable_distance_attenuation', False) else 'OFF'}")
         print(f"Distance Modulation: {'ON' if VISION_CONFIG.get('enable_distance_modulation', False) else 'OFF'}\n")
 
         self.stream = sd.OutputStream(
