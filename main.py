@@ -18,6 +18,44 @@ from scipy import signal
 from dataclasses import dataclass
 
 
+class DebugLogger:
+    """Lightweight CSV logger (safe to call from background threads)."""
+
+    def __init__(self, debug_dir: str):
+        os.makedirs(debug_dir, exist_ok=True)
+
+        self._lock = threading.Lock()
+        self._vision_fp = open(os.path.join(debug_dir, "vision_log.csv"), "w", newline="")
+        self._vision_w = csv.writer(self._vision_fp)
+        self._vision_w.writerow(["t", "az_cam_deg", "el_cam_deg", "dist_m", "conf", "cls_name"])
+
+        self._imu_fp = open(os.path.join(debug_dir, "imu_log.csv"), "w", newline="")
+        self._imu_w = csv.writer(self._imu_fp)
+        self._imu_w.writerow(["t", "qw", "qx", "qy", "qz", "roll_deg", "pitch_deg", "yaw_deg"])
+
+    def log_vision(self, t, az_deg, el_deg, dist_m, conf, cls_name):
+        with self._lock:
+            self._vision_w.writerow([float(t), float(az_deg), float(el_deg), float(dist_m),
+                                     float(conf) if conf is not None else 0.0, str(cls_name) if cls_name else ""])
+            self._vision_fp.flush()
+
+    def log_imu(self, t, qw, qx, qy, qz, roll, pitch, yaw):
+        with self._lock:
+            self._imu_w.writerow([float(t), float(qw), float(qx), float(qy), float(qz),
+                                  float(roll), float(pitch), float(yaw)])
+            self._imu_fp.flush()
+
+    def close(self):
+        try:
+            self._vision_fp.close()
+        except Exception:
+            pass
+        try:
+            self._imu_fp.close()
+        except Exception:
+            pass
+
+
 @dataclass
 class SourceState:
     """Single-source state (Phase 3): what vision wants the audio source to do."""
@@ -51,7 +89,7 @@ VISION_CONFIG = {
     "fps": 30,
     "use_mjpeg": True,
 
-    # YOLO 
+    # YOLO
     "model_path": "yolov8n.pt",
     "conf_thres": 0.25,
     "infer_hz": 8.0,            # FIXED: Reduced from 10 to 8 Hz for stability
@@ -109,10 +147,11 @@ VISION_CONFIG = {
     # Debug / UI
     "show_window": False,        # FIXED: Turn off during real runs
     "window_name": "Vision (YOLO Phase-2)",
-    
+
     # FIXED: Print throttling
     "print_every_n_frames": 30,  # Only print vision updates every N frames
 }
+
 
 def _open_camera_for_vision():
     # Lazy import so offline render can still run even if OpenCV isn't installed.
@@ -132,6 +171,7 @@ def _open_camera_for_vision():
         raise ValueError(f"Unknown VISION_CONFIG['camera_source']: {src}")
 
     return cap
+
 
 def _freeze_camera_settings(cap):
     import cv2
@@ -153,10 +193,12 @@ def _freeze_camera_settings(cap):
           f"{'MJPG' if VISION_CONFIG['use_mjpeg'] else ''}")
     print(f"[VISION][CAM] Actual:    {actual_w}x{actual_h}@{actual_fps:.2f} FOURCC={fourcc_str}")
 
+
 def _pixels_to_azimuth_deg(cx, W, hfov_deg):
     # nx in [-1, 1]
     nx = (cx - (W / 2.0)) / (W / 2.0)
     return nx * (hfov_deg / 2.0)
+
 
 def _pick_target_index_xyxy(xyxy, cls_ids, names, mode, allowed_classes):
     """
@@ -187,6 +229,7 @@ def _pick_target_index_xyxy(xyxy, cls_ids, names, mode, allowed_classes):
             best_area = areas[i]
             best_i = i
     return best_i
+
 
 class ObjectDetectionYOLO(threading.Thread):
     """
@@ -334,7 +377,7 @@ class ObjectDetectionYOLO(threading.Thread):
 
             # FIXED: Store timestamp for timing alignment
             t_vision = time.time()
-            
+
             self.processor.update_vision_target(
                 az_deg,
                 el_deg,
@@ -359,26 +402,6 @@ class ObjectDetectionYOLO(threading.Thread):
         if VISION_CONFIG["show_window"]:
             cv2.destroyWindow(VISION_CONFIG["window_name"])
         print("[VISION] Stopped.")
-
-# last edited 01/10/2026 working now trying to combine yolo
-#
-# NOTE ON TARGET RULES (keep this instruction)
-# ---------------------------------------------------------
-# When YOLO detects multiple things in a frame, you still need one thing to treat
-# as the "target" (the thing you'll turn into a single audio source).
-#
-# "Largest box" is a simple tie-breaker / prioritization rule:
-#   - Each detection has a bounding box area: (x2-x1) * (y2-y1)
-#   - "Largest box" means: choose the detection with the biggest area.
-# Why it's useful:
-#   - Bigger box ≈ object is closer / more dominant in view
-#   - Cheap heuristic early on
-#   - Stable with tracking (BoT-SORT IDs) because the "main" object often stays "main"
-#
-# In the "allowed_objects" mode, you are NOT choosing "largest among everything".
-# You are choosing "largest among your allow-list" (cup/chair/.../person).
-# The other mode "person_only" forces the target to be a person.
-# ---------------------------------------------------------
 
 
 # =========================================================
@@ -578,7 +601,6 @@ class HeadTrackingReceiver:
                 # Ignore malformed/empty packets
                 pass
 
-
     def get_euler(self):
         """
         Convert internal quaternion to roll, pitch, yaw (degrees).
@@ -647,12 +669,12 @@ class SpatialAudioProcessor:
             output_audio.append(mixed_output)
 
         full_audio = np.vstack(output_audio)
-        
+
         # FIXED: Normalize ONCE at the end (not per source)
         max_val = float(np.max(np.abs(full_audio)))
         if max_val > 0.95:
             full_audio *= 0.95 / max_val
-            
+
         if output_file is None:
             output_file = "simulated.wav"
             idx = 1
@@ -671,7 +693,7 @@ class SpatialAudioProcessor:
         """
         if not VISION_CONFIG.get("enable_distance_modulation", False):
             return audio
-            
+
         freq_close = 10.0  # Hz (close objects pulse fast)
         freq_far = 2.0     # Hz (far objects pulse slow)
         mod_depth = 0.4    # 40% modulation depth
@@ -693,14 +715,18 @@ class SpatialAudioProcessor:
         # FIXED: Move latency logging off callback thread
         self.latency_log_queue = []  # Store latency data for batch writing
         debug_dir = os.path.join(os.path.dirname(__file__), "debug_logs")
+        os.makedirs(debug_dir, exist_ok=True)
         latency_csv_path = os.path.join(debug_dir, "latency_final_aar_audio.csv")
         self.latency_log = open(latency_csv_path, "w", newline="")
         self.latency_writer = csv.writer(self.latency_log)
         self.latency_writer.writerow(["timestamp", "latency_ms"])
 
+        # Debug logger (vision + IMU)
+        self.logger = DebugLogger(debug_dir)
+
         # Head tracking receiver
-        self.imu = HeadTrackingReceiver(port=imu_port, logger=None)
-        
+        self.imu = HeadTrackingReceiver(port=imu_port, logger=self.logger)
+
         # FIXED: Use ONE consistent yaw signal (raw, no filtering/gain here)
         # Filtering/gain applied only in audio_callback for head tracking
         self.filtered_yaw = 0.0
@@ -778,7 +804,7 @@ class SpatialAudioProcessor:
 
     def update_vision_target(self, azimuth_deg, elevation_deg, yaw_deg, pitch_deg, distance_m=None, conf=None, cls_name=None, t_vision=None):
         """
-        FIXED: Provide a camera/head-relative vision target with timing alignment.
+        Provide a camera/head-relative vision target with timing alignment.
         yaw_deg/pitch_deg are RAW IMU angles (degrees) at the vision capture time.
         t_vision is the timestamp when vision captured this frame.
 
@@ -800,7 +826,7 @@ class SpatialAudioProcessor:
             self._vision_conf = c
             self._vision_cls_name = cname
 
-            # FIXED: Use RAW yaw (consistent signal everywhere)
+            # Use RAW yaw (consistent signal everywhere)
             if self.use_world_lock_for_vision:
                 # az_rel (head) = az_world - yaw  => az_world = az_rel + yaw
                 self._vision_az_world = float(azimuth_deg) + float(yaw_deg)
@@ -810,7 +836,6 @@ class SpatialAudioProcessor:
                 self._vision_el_world = None
 
             # Phase 3: update single-source state (MEASUREMENTS). Smoothing/fade happens in audio callback.
-            # World coords are what we want to persist (so head motion reorients listener, not the world).
             if self.use_world_lock_for_vision and (self._vision_az_world is not None):
                 az_w = float(self._vision_az_world)
                 el_w = float(self._vision_el_world)
@@ -820,23 +845,18 @@ class SpatialAudioProcessor:
 
             d = float(self._vision_dist_m) if self._vision_dist_m is not None else float(VISION_CONFIG.get("distance_fixed_m", 1.4))
 
-            # FIXED: g_meas derived from confidence (and optionally distance)
-            # Base gain on confidence - higher confidence = higher gain
-            g_conf = float(np.clip(c / 0.8, 0.0, 1.0))  # Normalize confidence to 0-1 range
-            
-            # Optional: Factor in distance (closer = louder, but capped)
-            # This is SEPARATE from distance attenuation in the audio engine
+            # Gain from confidence and (optionally) distance
+            g_conf = float(np.clip(c / 0.8, 0.0, 1.0))
             if VISION_CONFIG.get("enable_distance_attenuation", True):
                 ref_dist = float(VISION_CONFIG.get("distance_ref_m", 1.4))
-                dist_factor = ref_dist / max(d, 0.3)  # Closer = higher factor
-                dist_factor = float(np.clip(dist_factor, 0.5, 2.0))  # Limit range
+                dist_factor = ref_dist / max(d, 0.3)
+                dist_factor = float(np.clip(dist_factor, 0.5, 2.0))
             else:
                 dist_factor = 1.0
-            
-            # Combine confidence and distance factors
+
             g_meas = g_conf * dist_factor
-            g_meas = float(np.clip(g_meas, 
-                                  VISION_CONFIG.get("gain_min", 0.0), 
+            g_meas = float(np.clip(g_meas,
+                                  VISION_CONFIG.get("gain_min", 0.0),
                                   VISION_CONFIG.get("gain_max", 1.0)))
 
             if c >= gate_th:
@@ -849,10 +869,13 @@ class SpatialAudioProcessor:
                 self.source_state.cls_name = cname
                 self.source_state.last_update_t = t
 
-        # FIXED: Log vision data (off callback thread)
-        self.logger.log_vision(t, azimuth_deg, elevation_deg, d, c, cname)
+        # Log vision data (off callback thread)
+        try:
+            self.logger.log_vision(t, azimuth_deg, elevation_deg, d, c, cname)
+        except Exception:
+            pass
 
-        # ---------------- SOFA / HRTF support ----------------
+    # ---------------- SOFA / HRTF support ----------------
 
     def load_sofa_hrtf(self, sofa_file):
         """Load HRTF data from SOFA file."""
@@ -932,11 +955,11 @@ class SpatialAudioProcessor:
 
     def apply_distance_attenuation(self, audio, distance):
         """
-        FIXED: Distance attenuation with toggle
+        Distance attenuation with toggle
         """
         if not VISION_CONFIG.get("enable_distance_attenuation", True):
             return audio
-            
+
         ref_distance = 1.4
         attenuation = ref_distance / max(distance, 0.2)
         output = audio * min(attenuation, 3.0) * 0.6
@@ -958,7 +981,6 @@ class SpatialAudioProcessor:
         """EMA for angles, handling wrap-around properly."""
         old = self._wrap_deg(old_deg)
         meas = self._wrap_deg(meas_deg)
-        # shortest signed difference
         diff = self._wrap_deg(meas - old)
         return self._wrap_deg(old + float(beta) * diff)
 
@@ -982,7 +1004,6 @@ class SpatialAudioProcessor:
         self.prev_interp_hrir_left[source_idx] = hrir_l
         self.prev_interp_hrir_right[source_idx] = hrir_r
 
-        # FIXED: Robust block mixing from combined_aar.py (no per-source normalization)
         conv_left = signal.fftconvolve(mono_block, hrir_l, mode='full')
         conv_right = signal.fftconvolve(mono_block, hrir_r, mode='full')
 
@@ -996,7 +1017,6 @@ class SpatialAudioProcessor:
         output[:, 0] += conv_left[:output_length]
         output[:, 1] += conv_right[:output_length]
 
-        # Save new overlap
         if len(conv_left) > output_length:
             self.overlap_buffers[source_idx] = np.column_stack([
                 conv_left[output_length:],
@@ -1005,27 +1025,22 @@ class SpatialAudioProcessor:
         else:
             self.overlap_buffers[source_idx] = np.zeros((self.hrir_length - 1, 2), dtype=np.float32)
 
-        # Apply distance effects (with toggles)
         output = self.apply_distance_attenuation(output, source.distance)
         output = self.apply_distance_modulation(output, source.distance)
-
-        # FIXED: Removed per-source normalization - preserves distance-based loudness
 
         return output
 
     def audio_callback(self, outdata, frames, time_info, status):
         """
-        FIXED: Callback function with consistent yaw usage and final normalization only
+        Callback function with consistent yaw usage and final normalization only
         """
         t_now = time.time()
         t_send = self.imu.t_send
 
-        # FIXED: Queue latency data instead of writing immediately
         if t_send > 0:
             latency_ms = (t_now - t_send) * 1000.0
             self.latency_log_queue.append([t_now, latency_ms])
-            
-            # Batch write every 100 samples
+
             if len(self.latency_log_queue) >= 100:
                 self.latency_writer.writerows(self.latency_log_queue)
                 self.latency_log_queue.clear()
@@ -1033,25 +1048,22 @@ class SpatialAudioProcessor:
         if status:
             print(f"Audio status: {status}")
 
-        # FIXED: Get RAW IMU angles (consistent yaw signal)
+        # RAW IMU angles
         roll, pitch, yaw = self.imu.get_euler()
 
-        # FIXED: Apply gain and sign ONLY here (not mixed with raw elsewhere)
+        # Head-tracking mapping (single source default)
         target_yaw = -self.yaw_gain * yaw
         target_pitch = self.pitch_gain * pitch
 
-        # Smooth the filtered values
         alpha = 0.3
         self.filtered_yaw = (1.0 - alpha) * self.filtered_yaw + alpha * target_yaw
         self.filtered_pitch = (1.0 - alpha) * self.filtered_pitch + alpha * target_pitch
 
-        # Default (no vision): head-tracked, world-fixed sound (single source)
         az_for_audio = self.filtered_yaw
         el_for_audio = self.filtered_pitch
         dist_for_audio = None
         gain_for_audio = 1.0
 
-        # Phase 3: vision drives a single source state (az/el/dist/gain), then IMU reorients it.
         with self._vision_lock:
             ss = self.source_state
             v_active = bool(ss.active)
@@ -1064,13 +1076,13 @@ class SpatialAudioProcessor:
         fresh = v_active and ((t_now - v_last_t) <= self.vision_timeout_s)
 
         if fresh:
-            # FIXED: Convert world -> listener frame using RAW yaw (consistent)
-            meas_az = self._wrap_deg(v_az_w - float(yaw))
+            # Convert world -> listener frame using the SAME yaw mapping as head-tracking
+            # (world az minus raw head yaw, then apply yaw_gain like the baseline head-tracked path)
+            meas_az = self._wrap_deg((v_az_w - float(yaw)) * float(self.yaw_gain))
             meas_el = float(np.clip(v_el_w - float(pitch), -90.0, 90.0))
             meas_dist = float(v_dist)
             meas_gain = float(v_gain)
 
-            # If we just became "fresh" this frame, snap the EMAs to the measurement
             if not self._vision_was_fresh:
                 self._src_az_ema = meas_az
                 self._src_el_ema = meas_el
@@ -1089,12 +1101,10 @@ class SpatialAudioProcessor:
             self._src_gain_ema = (1.0 - b_g) * self._src_gain_ema + b_g * meas_gain
 
         else:
-            # No valid detection recently -> fade out the vision-driven loudness
             self._vision_was_fresh = False
             b_g = float(VISION_CONFIG.get("gain_smooth_beta", 0.20))
-            self._src_gain_ema = (1.0 - b_g) * self._src_gain_ema  # towards 0
+            self._src_gain_ema = (1.0 - b_g) * self._src_gain_ema
 
-        # If vision gain is meaningfully on, use vision-driven az/el/dist. Otherwise keep pure head tracking.
         if self._src_gain_ema > 0.02:
             az_for_audio = self._src_az_ema
             el_for_audio = self._src_el_ema
@@ -1113,7 +1123,6 @@ class SpatialAudioProcessor:
                 spatialized = self.spatialize_audio_block(chunk, i)
                 mixed_output += spatialized
 
-        # FIXED: Normalize ONCE at the end (preserves distance-based loudness)
         max_val = float(np.max(np.abs(mixed_output)))
         if max_val > 0.95:
             mixed_output *= 0.95 / max_val
@@ -1163,12 +1172,11 @@ class SpatialAudioProcessor:
         if hasattr(self, 'stream'):
             self.stream.stop()
             self.stream.close()
-        
-        # FIXED: Flush any remaining latency data
+
         if self.latency_log_queue:
             self.latency_writer.writerows(self.latency_log_queue)
             self.latency_log_queue.clear()
-            
+
         try:
             self.latency_log.close()
         except Exception:
@@ -1178,6 +1186,11 @@ class SpatialAudioProcessor:
 
         if self.is_recording:
             self.stop_recording()
+
+        try:
+            self.logger.close()
+        except Exception:
+            pass
 
         print("\nPlayback stopped")
 
@@ -1220,9 +1233,6 @@ class SpatialAudioProcessor:
             self.start_recording()
 
 
-    # Offline rendering has been removed. Real-time recording is available via start_recording/stop_recording/toggle_recording.
-
-
 if __name__ == "__main__":
     print("=" * 70)
     print("HRTF SPATIAL AUDIO PROCESSOR (HEAD-TRACKED, QUATERNIONS)")
@@ -1238,7 +1248,7 @@ if __name__ == "__main__":
             imu_port=5005
         )
 
-        # Optional vision thread (may be started elsewhere); ensure the name exists for cleanup.
+        # Vision thread (YOLO) + simple CLI controls (recording toggle)
         vision_thread = None
 
         mode = input(
@@ -1257,6 +1267,52 @@ if __name__ == "__main__":
             processor.export_offline_render(duration_seconds=duration)
         else:
             processor.start_playback()
+
+            # Start vision thread (Phase 2.5). This was present in phase2.5 but missing here.
+            processor.use_world_lock_for_vision = True
+            vision_thread = ObjectDetectionYOLO(processor)
+            vision_thread.start()
+            print("[MAIN] Vision thread started:", vision_thread.is_alive())
+
+            # Simple CLI controls in background:
+            #  - 'r' + Enter: toggle recording
+            #  - 'v' + Enter: toggle vision on/off
+            #  - 'q' + Enter: quit
+            ctl = {"vision": vision_thread}
+
+            def _control_loop():
+                while True:
+                    try:
+                        cmd = input("[CTRL] r=record, v=toggle vision, q=quit > ").strip().lower()
+                    except Exception:
+                        return
+                    if cmd == "r":
+                        processor.toggle_recording()
+                    elif cmd == "v":
+                        vt = ctl.get("vision")
+                        if vt is None or not vt.is_alive():
+                            try:
+                                vt = ObjectDetectionYOLO(processor)
+                                vt.start()
+                                ctl["vision"] = vt
+                                print("[CTRL] Vision started.")
+                            except Exception as e:
+                                print(f"[CTRL] Could not start vision: {e}")
+                        else:
+                            try:
+                                vt.stop()
+                                vt.join(timeout=2.0)
+                            except Exception:
+                                pass
+                            ctl["vision"] = None
+                            print("[CTRL] Vision stopped.")
+                    elif cmd == "q":
+                        raise KeyboardInterrupt
+                    else:
+                        print("[CTRL] Unknown command.")
+
+            threading.Thread(target=_control_loop, daemon=True).start()
+
             try:
                 while True:
                     time.sleep(0.5)
@@ -1265,9 +1321,14 @@ if __name__ == "__main__":
             finally:
                 # Stop vision thread if it was started
                 try:
-                    if 'vision_thread' in globals() and vision_thread is not None:
-                        vision_thread.stop()
-                        vision_thread.join(timeout=2.0)
+                    vt = None
+                    try:
+                        vt = locals().get('ctl', {}).get('vision', None)
+                    except Exception:
+                        vt = None
+                    if vt is not None:
+                        vt.stop()
+                        vt.join(timeout=2.0)
                 except Exception:
                     pass
                 # Ensure playback is stopped
@@ -1275,7 +1336,6 @@ if __name__ == "__main__":
                     processor.stop_playback()
                 except Exception:
                     pass
-
 
     except FileNotFoundError as e:
         print(f"\nError: {e}")
