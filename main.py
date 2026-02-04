@@ -1,3 +1,8 @@
+# ============================================================================
+# MULTIMODAL SPATIAL AUDIO TOOLKIT - PHASE 3.5
+# Head-tracked HRTF spatial audio with real-time vision-driven source control
+# ============================================================================
+
 import socket
 import threading
 import time
@@ -183,16 +188,16 @@ def _pick_target_index_xyxy(xyxy, cls_ids, names, mode, allowed_classes):
             best_i = i
     return best_i
 
-class VisionYOLOPhase2(threading.Thread):
+class ObjectDetectionYOLO(threading.Thread):
     """
-    Minimal vision loop:
-      - reads camera
+    Real-time object detection and tracking:
+      - reads camera frames
       - runs YOLO at a fixed rate
-      - selects ONE target
-      - converts (cx) -> azimuth_deg
-      - calls processor.update_vision_target(az, 0, yaw, pitch)
+      - selects ONE target from detections
+      - converts pixel coordinates to spatial angles
+      - sends target updates to audio processor
 
-    No IDs. No distance. No elevation. Single target only.
+    Produces single target with azimuth, elevation, distance, and confidence.
     """
 
     def __init__(self, processor):
@@ -380,9 +385,10 @@ class VisionYOLOPhase2(threading.Thread):
 # AudioSource: single mono audio stream + spatial params
 # =========================================================
 
-class AudioSource:
+class SpatialAudioSource:
     """
-    Represents a single spatial audio source with its own audio file and position.
+    Represents a single spatial audio source with its own audio file and spatial position parameters.
+    Handles audio playback, resampling, normalization, and position interpolation.
     """
 
     def __init__(self, audio_file, sample_rate, source_id,
@@ -502,10 +508,10 @@ class AudioSource:
 # IMUReceiver: receives quaternions over UDP and exposes Euler
 # =========================================================
 
-class IMUReceiver:
+class HeadTrackingReceiver:
     """
-    Background UDP listener that receives quaternions: 't_send,qw,qx,qy,qz'
-    and exposes roll, pitch, yaw in degrees.
+    Background UDP listener that receives head orientation quaternions and converts to Euler angles.
+    Enables head-tracked audio by providing real-time roll, pitch, yaw orientation data.
     """
 
     def __init__(self, ip="0.0.0.0", port=5005, logger=None):
@@ -608,7 +614,7 @@ class IMUReceiver:
 # MultiSourceHRTFAudio: HRTF engine + head-tracking + vision hook
 # =========================================================
 
-class MultiSourceHRTFAudio:
+class SpatialAudioProcessor:
     def export_offline_render(self, duration_seconds=5, output_file=None):
         """
         Render a fixed-duration spatial audio output to a WAV file (offline, not real-time).
@@ -692,9 +698,8 @@ class MultiSourceHRTFAudio:
         self.latency_writer = csv.writer(self.latency_log)
         self.latency_writer.writerow(["timestamp", "latency_ms"])
 
-        # IMU receiver
-        self.logger = SimulationLogger()
-        self.imu = IMUReceiver(port=imu_port, logger=self.logger)
+        # Head tracking receiver
+        self.imu = HeadTrackingReceiver(port=imu_port, logger=None)
         
         # FIXED: Use ONE consistent yaw signal (raw, no filtering/gain here)
         # Filtering/gain applied only in audio_callback for head tracking
@@ -746,7 +751,7 @@ class MultiSourceHRTFAudio:
         self.sources = []
         for i, audio_file in enumerate(audio_files):
             azimuth = (i - len(audio_files) // 2) * 40.0
-            source = AudioSource(audio_file, sample_rate, i, azimuth=azimuth)
+            source = SpatialAudioSource(audio_file, sample_rate, i, azimuth=azimuth)
             self.sources.append(source)
 
         self.prev_interp_hrir_left = [None] * len(self.sources)
@@ -1226,12 +1231,15 @@ if __name__ == "__main__":
     try:
         audio_files = ["rain.mp3"]
 
-        processor = MultiSourceHRTFAudio(
+        processor = SpatialAudioProcessor(
             audio_files=audio_files,
             sofa_file="MIT_KEMAR_normal_pinna.sofa",
             sample_rate=44100,
             imu_port=5005
         )
+
+        # Optional vision thread (may be started elsewhere); ensure the name exists for cleanup.
+        vision_thread = None
 
         mode = input(
             "Choose mode:\n"
@@ -1255,21 +1263,18 @@ if __name__ == "__main__":
             except KeyboardInterrupt:
                 print("\n[MAIN] Stopping playback...")
             finally:
-                processor.stop_playback()
+                # Stop vision thread if it was started
                 try:
-                    while True:
-                        time.sleep(0.5)
-                except KeyboardInterrupt:
-                    print("\n[MAIN] Stopping...")
-            except KeyboardInterrupt:
-                print("\n[MAIN] Stopping...")
-            finally:
-                try:
-                    vision_thread.stop()
-                    vision_thread.join(timeout=2.0)
+                    if 'vision_thread' in globals() and vision_thread is not None:
+                        vision_thread.stop()
+                        vision_thread.join(timeout=2.0)
                 except Exception:
                     pass
-                processor.stop_playback()
+                # Ensure playback is stopped
+                try:
+                    processor.stop_playback()
+                except Exception:
+                    pass
 
 
     except FileNotFoundError as e:
