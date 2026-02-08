@@ -766,6 +766,9 @@ class SpatialAudioProcessor:
         self._src_gain_ema = 1.0
         self._vision_was_fresh = False
 
+        # Initialization gate: prevent audio output until IMU ready
+        self._audio_ready = False
+
         # Load SOFA HRTF data
         print(f"Loading SOFA file: {sofa_file}")
         self.load_sofa_hrtf(sofa_file)
@@ -1025,8 +1028,11 @@ class SpatialAudioProcessor:
         else:
             self.overlap_buffers[source_idx] = np.zeros((self.hrir_length - 1, 2), dtype=np.float32)
 
+        # Distance encoding (choose ONE approach)
         output = self.apply_distance_attenuation(output, source.distance)
-        output = self.apply_distance_modulation(output, source.distance)
+        # NOTE: apply_distance_modulation is disabled by default
+        # If you want pulsing instead, swap the above line with:
+        # output = self.apply_distance_modulation(output, source.distance)
 
         return output
 
@@ -1034,6 +1040,11 @@ class SpatialAudioProcessor:
         """
         Callback function with consistent yaw usage and final normalization only
         """
+        # Gate: Don't output audio until IMU is initialized
+        if not self._audio_ready:
+            outdata[:] = np.zeros((frames, 2), dtype=np.float32)
+            return
+        
         t_now = time.time()
         t_send = self.imu.t_send
 
@@ -1076,9 +1087,9 @@ class SpatialAudioProcessor:
         fresh = v_active and ((t_now - v_last_t) <= self.vision_timeout_s)
 
         if fresh:
-            # Convert world -> listener frame using the SAME yaw mapping as head-tracking
-            # (world az minus raw head yaw, then apply yaw_gain like the baseline head-tracked path)
-            meas_az = self._wrap_deg((v_az_w - float(yaw)) * float(self.yaw_gain))
+            # Convert world -> listener frame using raw yaw (no gain)
+            # Gain is only applied in baseline head-tracking path (line 1055)
+            meas_az = self._wrap_deg(v_az_w - float(yaw))
             meas_el = float(np.clip(v_el_w - float(pitch), -90.0, 90.0))
             meas_dist = float(v_dist)
             meas_gain = float(v_gain)
@@ -1139,6 +1150,19 @@ class SpatialAudioProcessor:
             print("Already playing")
             return
 
+        # Wait for IMU to send first packet before starting audio
+        print("⏳ Waiting for IMU initialization...")
+        timeout = time.time() + 3.0
+        while self.imu.t_send == 0.0 and time.time() < timeout:
+            time.sleep(0.05)
+        
+        if self.imu.t_send == 0.0:
+            print("⚠️  WARNING: IMU not responding (starting anyway)")
+        else:
+            print("✅ IMU ready")
+        
+        # Mark audio as ready (enables audio_callback output)
+        self._audio_ready = True
         self.is_playing = True
 
         for source in self.sources:
