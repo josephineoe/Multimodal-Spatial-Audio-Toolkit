@@ -142,7 +142,6 @@ VISION_CONFIG = {
 
     # FIXED: Toggles for distance effects (debug-friendly)
     "enable_distance_attenuation": True,  # Controls distance-based loudness
-    "enable_distance_modulation": False,   # Controls parking sensor effect (default off)
 
     # Debug / UI
     "show_window": False,        # FIXED: Turn off during real runs
@@ -528,6 +527,15 @@ class SpatialAudioSource:
 
 
 # =========================================================
+# IMU / WORLD-LOCK SIGN CONVENTION
+# =========================================================
+# YAW_SIGN controls yaw direction convention throughout the system:
+#   -1: rightward head turn maps to negative yaw (default)
+#   +1: rightward head turn maps to positive yaw (flipped convention)
+YAW_SIGN = -1
+
+
+# =========================================================
 # IMUReceiver: receives quaternions over UDP and exposes Euler
 # =========================================================
 
@@ -700,6 +708,10 @@ class SpatialAudioProcessor:
         self.latency_writer = csv.writer(self.latency_log)
         self.latency_writer.writerow(["timestamp", "latency_ms"])
 
+        # Throttled audio params print
+        self._audio_print_counter = 0
+        self._audio_print_interval = 50  # Print every N callbacks (~1 sec at 4096 buffer)
+
         # Debug logger (vision + IMU)
         self.logger = DebugLogger(debug_dir)
 
@@ -810,8 +822,8 @@ class SpatialAudioProcessor:
 
             # Use RAW yaw (consistent signal everywhere)
             if self.use_world_lock_for_vision:
-                # az_rel (head) = az_world - yaw  => az_world = az_rel + yaw
-                self._vision_az_world = float(azimuth_deg) + float(yaw_deg)
+                # az_rel (head) = az_world - (YAW_SIGN * yaw)  => az_world = az_rel + (YAW_SIGN * yaw)
+                self._vision_az_world = float(azimuth_deg) + (YAW_SIGN * float(yaw_deg))
                 self._vision_el_world = float(elevation_deg) + float(pitch_deg)
             else:
                 self._vision_az_world = None
@@ -1038,9 +1050,12 @@ class SpatialAudioProcessor:
 
         # RAW IMU angles
         roll, pitch, yaw = self.imu.get_euler()
+        
+        # Apply YAW_SIGN for consistent convention throughout system
+        yaw_signed = YAW_SIGN * yaw
 
         # Head-tracking mapping (single source default)
-        target_yaw = -self.yaw_gain * yaw
+        target_yaw = self.yaw_gain * yaw_signed
         target_pitch = self.pitch_gain * pitch
 
         alpha = 0.3
@@ -1050,7 +1065,7 @@ class SpatialAudioProcessor:
         az_for_audio = self.filtered_yaw
         el_for_audio = self.filtered_pitch
         dist_for_audio = None
-        gain_for_audio = 1.0
+        gain_for_audio = 1.0 #already forced to be 1.0
 
         with self._vision_lock:
             ss = self.source_state
@@ -1064,9 +1079,9 @@ class SpatialAudioProcessor:
         fresh = v_active and ((t_now - v_last_t) <= self.vision_timeout_s)
 
         if fresh:
-            # Convert world -> listener frame using raw yaw (no gain)
-            # Gain is only applied in baseline head-tracking path (line 1055)
-            meas_az = self._wrap_deg(v_az_w - float(yaw))
+            # Convert world -> listener frame using yaw with YAW_SIGN applied (no gain)
+            # Gain is only applied in baseline head-tracking path
+            meas_az = self._wrap_deg(v_az_w - yaw_signed)
             meas_el = float(np.clip(v_el_w - float(pitch), -90.0, 90.0))
             meas_dist = float(v_dist)
             meas_gain = float(v_gain)
@@ -1102,6 +1117,13 @@ class SpatialAudioProcessor:
         if self.sources:
             self.sources[0].set_target_position(azimuth=az_for_audio, elevation=el_for_audio, distance=dist_for_audio)
             self.sources[0].set_target_gain(gain_for_audio)
+
+        # Throttled debug print of audio parameters
+        self._audio_print_counter += 1
+        if self._audio_print_counter >= self._audio_print_interval:
+            self._audio_print_counter = 0
+            dist_str = f"{dist_for_audio:.2f}m" if dist_for_audio is not None else "None"
+            print(f"[AUDIO] az={az_for_audio:7.1f}° el={el_for_audio:6.1f}° dist={dist_str} gain={gain_for_audio:.2f} fresh={fresh}")
 
         mixed_output = np.zeros((frames, 2), dtype=np.float32)
 
@@ -1158,7 +1180,6 @@ class SpatialAudioProcessor:
         print("  • If vision target is updated recently, source 0 follows vision.")
         print("  • Press Ctrl+C in the terminal to stop playback\n")
         print(f"\nDistance Attenuation: {'ON' if VISION_CONFIG.get('enable_distance_attenuation', False) else 'OFF'}")
-        print(f"Distance Modulation: {'ON' if VISION_CONFIG.get('enable_distance_modulation', False) else 'OFF'}\n")
 
         self.stream = sd.OutputStream(
             samplerate=self.sample_rate,
@@ -1240,7 +1261,7 @@ if __name__ == "__main__":
     print("=" * 70)
 
     try:
-        audio_files = ["rain.mp3"]
+        audio_files = ["rain.wav"] #, "drums.wav"]
 
         processor = SpatialAudioProcessor(
             audio_files=audio_files,
@@ -1278,17 +1299,22 @@ if __name__ == "__main__":
             # Simple CLI controls in background:
             #  - 'r' + Enter: toggle recording
             #  - 'v' + Enter: toggle vision on/off
+            #  - 'd' + Enter: toggle YOLO display (debug)
             #  - 'q' + Enter: quit
             ctl = {"vision": vision_thread}
 
             def _control_loop():
                 while True:
                     try:
-                        cmd = input("[CTRL] r=record, v=toggle vision, q=quit > ").strip().lower()
+                        cmd = input("[CTRL] r=record, v=toggle vision, d=debug display, q=quit > ").strip().lower()
                     except Exception:
                         return
                     if cmd == "r":
                         processor.toggle_recording()
+                    elif cmd == "d":
+                        VISION_CONFIG["show_window"] = not VISION_CONFIG["show_window"]
+                        state = "ON" if VISION_CONFIG["show_window"] else "OFF"
+                        print(f"[CTRL] YOLO debug display: {state}")
                     elif cmd == "v":
                         vt = ctl.get("vision")
                         if vt is None or not vt.is_alive():
