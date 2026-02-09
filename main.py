@@ -117,7 +117,7 @@ VISION_CONFIG = {
 
     # Gain shaping from distance (simple): gain ~= ref/dist, clamped
     "distance_ref_m": 1.4,
-    "gain_min": 0.0,
+    "gain_min": 0.3,  # Change from 0.0 to 0.3 (keeps audio at least 30% volume)
     "gain_max": 1.0,
     "gain_smooth_beta": 0.20,
 
@@ -686,27 +686,6 @@ class SpatialAudioProcessor:
         print(f"   Duration: {duration_seconds:.2f}s")
         print(f"   Sample rate: {self.sample_rate}Hz")
 
-    def apply_distance_modulation(self, audio, distance):
-        """
-        FIXED: Parking sensor modulation with toggle
-        Faster pulses = closer object
-        """
-        if not VISION_CONFIG.get("enable_distance_modulation", False):
-            return audio
-
-        freq_close = 10.0  # Hz (close objects pulse fast)
-        freq_far = 2.0     # Hz (far objects pulse slow)
-        mod_depth = 0.4    # 40% modulation depth
-        dist_clamped = float(np.clip(distance, 0.5, 6.0))
-        t_norm = (6.0 - dist_clamped) / 5.5  # 0 = far, 1 = close
-        mod_freq = freq_far + (freq_close - freq_far) * t_norm
-        num_samples = len(audio)
-        t = np.arange(num_samples) / self.sample_rate
-        envelope = 1.0 + mod_depth * np.sin(2 * np.pi * mod_freq * t)
-        if audio.ndim == 2:
-            return audio * envelope[:, np.newaxis]
-        else:
-            return audio * envelope
 
     def __init__(self, audio_files, sofa_file, sample_rate=44100, imu_port=5005):
         self.sample_rate = sample_rate
@@ -1030,9 +1009,7 @@ class SpatialAudioProcessor:
 
         # Distance encoding (choose ONE approach)
         output = self.apply_distance_attenuation(output, source.distance)
-        # NOTE: apply_distance_modulation is disabled by default
-        # If you want pulsing instead, swap the above line with:
-        # output = self.apply_distance_modulation(output, source.distance)
+        # ...existing code...
 
         return output
 
