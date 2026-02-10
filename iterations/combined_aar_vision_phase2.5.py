@@ -29,8 +29,7 @@ VISION_CONFIG = {
     "fps": 30,
     "use_mjpeg": True,
 
-    # YOLO (you can upgrade to yolo11n.pt later)
-    "model_path": "yolov8n.pt",
+    "model_path": "yolo11n.pt",
     "conf_thres": 0.40,
     "infer_hz": 10.0,            # 8–12 Hz recommended
 

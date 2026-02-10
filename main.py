@@ -149,7 +149,7 @@ VISION_CONFIG = {
     "use_mjpeg": True,
 
     # YOLO
-    "model_path": "yolov11n.pt",
+    "model_path": "yolo11n.pt",
     "conf_thres": 0.25,
     "infer_hz": 8.0,            # FIXED: Reduced from 10 to 8 Hz for stability
 
@@ -352,7 +352,16 @@ class ObjectDetectionYOLO(threading.Thread):
         from ultralytics import YOLO
 
         print("[VISION] Starting YOLO Phase-2 thread...")
-        model = YOLO(VISION_CONFIG["model_path"])
+        
+        # Build full path to model file (relative to script location)
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        model_path = os.path.join(script_dir, VISION_CONFIG["model_path"])
+        
+        if not os.path.exists(model_path):
+            print(f"[VISION][ERR] Model file not found: {model_path}")
+            return
+        
+        model = YOLO(model_path)
         names = model.names
 
         cap = _open_camera_for_vision()
@@ -383,73 +392,52 @@ class ObjectDetectionYOLO(threading.Thread):
             next_t = now + infer_interval
             self._frame_count += 1
 
-            # YOLO inference (no tracking IDs)
-            res = model(frame, conf=VISION_CONFIG["conf_thres"], verbose=False)[0]
-            boxes = res.boxes
+            # YOLO inference with tracking
+            res = model.track(frame, conf=VISION_CONFIG["conf_thres"], persist=True, verbose=False)[0]
+            tracks = res
 
-            if boxes is None or len(boxes) == 0:
+            if tracks is None or len(tracks) == 0:
                 if VISION_CONFIG["show_window"]:
                     cv2.imshow(VISION_CONFIG["window_name"], res.plot())
                     if (cv2.waitKey(1) & 0xFF) == ord("q"):
                         self.stop()
                 continue
 
-            xyxy = boxes.xyxy.cpu().numpy()
-            cls_ids = boxes.cls.cpu().numpy().astype(int)
-            confs = boxes.conf.cpu().numpy()
+            # Process each track
+            for track in tracks:
+                cls_id = int(track.cls)
+                cls_name = names.get(cls_id, str(cls_id))
+                if cls_name != "person" or track.id is None:
+                    continue
+                person_id = int(track.id)
+                source_id = person_id - 1  # ID 1 -> source 0, ID 2 -> source 1, etc.
+                if source_id >= len(self.processor.sources):
+                    continue
 
-            idx = _pick_target_index_xyxy(
-                xyxy=xyxy,
-                cls_ids=cls_ids,
-                names=names,
-                mode=VISION_CONFIG["target_mode"],
-                allowed_classes=VISION_CONFIG["allowed_classes"],
-            )
+                x1, y1, x2, y2 = track.xyxy.cpu().numpy()
+                cx = 0.5 * (x1 + x2)
+                cy = 0.5 * (y1 + y2)
+                H, W = frame.shape[:2]
 
-            if idx is None:
-                if VISION_CONFIG["show_window"]:
-                    cv2.imshow(VISION_CONFIG["window_name"], res.plot())
-                    if (cv2.waitKey(1) & 0xFF) == ord("q"):
-                        self.stop()
-                continue
+                az_deg = _pixels_to_azimuth_deg(cx, W, VISION_CONFIG["hfov_deg"])
+                vfov_deg = self._compute_vfov_deg(VISION_CONFIG["hfov_deg"], W, H)
+                ny = (cy - (H / 2.0)) / (H / 2.0)
+                el_deg = -ny * (vfov_deg / 2.0)
 
-            x1, y1, x2, y2 = xyxy[idx]
-            cx = 0.5 * (x1 + x2)
-            cy = 0.5 * (y1 + y2)
-            H, W = frame.shape[:2]
+                roll, pitch, yaw = self.processor.imu.get_euler()
+                conf = float(track.conf.cpu().numpy())
+                dist_m = self._estimate_distance_m(x1, y1, x2, y2, cls_name, W, H)
+                t_vision = time.time()
 
-            az_deg = _pixels_to_azimuth_deg(cx, W, VISION_CONFIG["hfov_deg"])
-            # Elevation: map vertical position to degrees (center=0, up=+max, down=-max)
-            vfov_deg = self._compute_vfov_deg(VISION_CONFIG["hfov_deg"], W, H)
-            ny = (cy - (H / 2.0)) / (H / 2.0)  # -1 (top) to +1 (bottom)
-            el_deg = -ny * (vfov_deg / 2.0)    # up is positive, down is negative
+                self.processor.update_vision_target(
+                    az_deg, el_deg, yaw_deg=yaw, pitch_deg=pitch,
+                    distance_m=dist_m, conf=conf, cls_name=cls_name,
+                    t_vision=t_vision, source_id=source_id
+                )
 
-            # FIXED: Get RAW IMU angles for world-lock update (consistent yaw signal)
-            roll, pitch, yaw = self.processor.imu.get_euler()
-
-            cls_name = names.get(int(cls_ids[idx]), str(int(cls_ids[idx])))
-            conf = float(confs[idx])
-
-            # Estimate distance for the CURRENT single target (Phase 2.5)
-            dist_m = self._estimate_distance_m(x1, y1, x2, y2, cls_name, W, H)
-
-            # FIXED: Store timestamp for timing alignment
-            t_vision = time.time()
-
-            self.processor.update_vision_target(
-                az_deg,
-                el_deg,
-                yaw_deg=yaw,
-                pitch_deg=pitch,
-                distance_m=dist_m,
-                conf=conf,
-                cls_name=cls_name,
-                t_vision=t_vision,  # FIXED: Pass vision timestamp
-            )
-
-            # FIXED: Throttle prints - only print every N frames
-            if self._frame_count % print_every == 0:
-                print(f"[VISION] target={cls_name} conf={conf:.2f} az_deg={az_deg:.1f} el_deg={el_deg:.1f} dist_m={dist_m:.2f}")
+                # Throttle prints - only print every N frames
+                if self._frame_count % print_every == 0:
+                    print(f"[VISION] personID={person_id} source={source_id} conf={conf:.2f} az_deg={az_deg:.1f} el_deg={el_deg:.1f} dist_m={dist_m:.2f}")
 
             if VISION_CONFIG["show_window"]:
                 cv2.imshow(VISION_CONFIG["window_name"], res.plot())
@@ -779,35 +767,8 @@ class SpatialAudioProcessor:
         self.yaw_gain = 2.0
         self.pitch_gain = 2.0
 
-        # Vision state (FIXED: belongs here, not AudioSource)
-        self._vision_lock = threading.Lock()
-        self._vision_az_cam = None
-        self._vision_el_cam = None
-        self._vision_t = 0.0
-        self._vision_az_world = None
-        self._vision_el_world = None
-        self._vision_dist_m = None
-        self._vision_conf = 0.0
-        self._vision_cls_name = ""
-        self.use_world_lock_for_vision = True
         # Phase 3: gating + fade out when detection disappears
         self.vision_timeout_s = float(VISION_CONFIG.get("no_detection_fade_s", 0.75))
-
-        # Phase 3: single source state struct (room to expand to multiple later)
-        self.source_state = SourceState(
-            azimuth_deg=0.0,
-            elevation_deg=0.0,
-            distance_est=float(VISION_CONFIG.get("distance_fixed_m", 1.4)),
-            gain=1.0,
-            active=False,
-        )
-
-        # Phase 3: smoothed listener-relative controls for the single vision source
-        self._src_az_ema = 0.0
-        self._src_el_ema = 0.0
-        self._src_dist_ema = float(VISION_CONFIG.get("distance_fixed_m", 1.4))
-        self._src_gain_ema = 1.0
-        self._vision_was_fresh = False
 
         # Initialization gate: prevent audio output until IMU ready
         self._audio_ready = False
@@ -825,6 +786,24 @@ class SpatialAudioProcessor:
             azimuth = (i - len(audio_files) // 2) * 40.0
             source = SpatialAudioSource(audio_file, sample_rate, i, azimuth=azimuth)
             self.sources.append(source)
+
+        # Phase 3: multiple source states for multi-person tracking
+        self.source_states = [SourceState(
+            azimuth_deg=0.0,
+            elevation_deg=0.0,
+            distance_est=float(VISION_CONFIG.get("distance_fixed_m", 1.4)),
+            gain=1.0,
+            active=False,
+        ) for _ in self.sources]
+
+        self._source_states_lock = threading.Lock()
+
+        # Phase 3: smoothed listener-relative controls for each vision source
+        self._src_az_ema = [0.0] * len(self.sources)
+        self._src_el_ema = [0.0] * len(self.sources)
+        self._src_dist_ema = [float(VISION_CONFIG.get("distance_fixed_m", 1.4))] * len(self.sources)
+        self._src_gain_ema = [1.0] * len(self.sources)
+        self._vision_was_fresh = [False] * len(self.sources)
 
         self.prev_interp_hrir_left = [None] * len(self.sources)
         self.prev_interp_hrir_right = [None] * len(self.sources)
@@ -848,7 +827,7 @@ class SpatialAudioProcessor:
 
     # ---------------- Vision API ----------------
 
-    def update_vision_target(self, azimuth_deg, elevation_deg, yaw_deg, pitch_deg, distance_m=None, conf=None, cls_name=None, t_vision=None):
+    def update_vision_target(self, azimuth_deg, elevation_deg, yaw_deg, pitch_deg, distance_m=None, conf=None, cls_name=None, t_vision=None, source_id=0):
         """
         Provide a camera/head-relative vision target with timing alignment.
         yaw_deg/pitch_deg are RAW IMU angles (degrees) at the vision capture time.
@@ -862,58 +841,33 @@ class SpatialAudioProcessor:
         c = float(conf) if conf is not None else 0.0
         cname = str(cls_name) if cls_name is not None else ""
 
-        with self._vision_lock:
-            self._vision_az_cam = float(azimuth_deg)
-            self._vision_el_cam = float(elevation_deg)
-            self._vision_t = t
-            if distance_m is not None:
-                self._vision_dist_m = float(distance_m)
+        # Compute world coords
+        az_w = float(azimuth_deg) + (YAW_SIGN * float(yaw_deg))
+        el_w = float(elevation_deg) + float(pitch_deg)
+        d = float(distance_m) if distance_m is not None else float(VISION_CONFIG.get("distance_fixed_m", 1.4))
 
-            self._vision_conf = c
-            self._vision_cls_name = cname
+        # Gain from confidence and (optionally) distance
+        g_conf = float(np.clip(c / 0.8, 0.0, 1.0))
+        if VISION_CONFIG.get("enable_distance_attenuation", True):
+            ref_dist = float(VISION_CONFIG.get("distance_ref_m", 1.4))
+            dist_factor = ref_dist / max(d, 0.3)
+            dist_factor = float(np.clip(dist_factor, 0.5, 2.0))
+        else:
+            dist_factor = 1.0
+        g_meas = g_conf * dist_factor
+        g_meas = float(np.clip(g_meas, VISION_CONFIG.get("gain_min", 0.0), VISION_CONFIG.get("gain_max", 1.0)))
 
-            # Use RAW yaw (consistent signal everywhere)
-            if self.use_world_lock_for_vision:
-                # az_rel (head) = az_world - (YAW_SIGN * yaw)  => az_world = az_rel + (YAW_SIGN * yaw)
-                self._vision_az_world = float(azimuth_deg) + (YAW_SIGN * float(yaw_deg))
-                self._vision_el_world = float(elevation_deg) + float(pitch_deg)
-            else:
-                self._vision_az_world = None
-                self._vision_el_world = None
-
-            # Phase 3: update single-source state (MEASUREMENTS). Smoothing/fade happens in audio callback.
-            if self.use_world_lock_for_vision and (self._vision_az_world is not None):
-                az_w = float(self._vision_az_world)
-                el_w = float(self._vision_el_world)
-            else:
-                az_w = float(self._vision_az_cam)
-                el_w = float(self._vision_el_cam)
-
-            d = float(self._vision_dist_m) if self._vision_dist_m is not None else float(VISION_CONFIG.get("distance_fixed_m", 1.4))
-
-            # Gain from confidence and (optionally) distance
-            g_conf = float(np.clip(c / 0.8, 0.0, 1.0))
-            if VISION_CONFIG.get("enable_distance_attenuation", True):
-                ref_dist = float(VISION_CONFIG.get("distance_ref_m", 1.4))
-                dist_factor = ref_dist / max(d, 0.3)
-                dist_factor = float(np.clip(dist_factor, 0.5, 2.0))
-            else:
-                dist_factor = 1.0
-
-            g_meas = g_conf * dist_factor
-            g_meas = float(np.clip(g_meas,
-                                  VISION_CONFIG.get("gain_min", 0.0),
-                                  VISION_CONFIG.get("gain_max", 1.0)))
-
+        with self._source_states_lock:
+            ss = self.source_states[source_id]
             if c >= gate_th:
-                self.source_state.azimuth_deg = az_w
-                self.source_state.elevation_deg = el_w
-                self.source_state.distance_est = d
-                self.source_state.gain = g_meas
-                self.source_state.active = True
-                self.source_state.conf = c
-                self.source_state.cls_name = cname
-                self.source_state.last_update_t = t
+                ss.azimuth_deg = az_w
+                ss.elevation_deg = el_w
+                ss.distance_est = d
+                ss.gain = g_meas
+                ss.active = True
+                ss.conf = c
+                ss.cls_name = cname
+                ss.last_update_t = t
 
         # Log vision data (off callback thread)
         try:
@@ -1108,64 +1062,75 @@ class SpatialAudioProcessor:
         dist_for_audio = None
         gain_for_audio = 1.0 #already forced to be 1.0
 
-        with self._vision_lock:
-            ss = self.source_state
-            v_active = bool(ss.active)
-            v_last_t = float(ss.last_update_t)
-            v_az_w = float(ss.azimuth_deg)
-            v_el_w = float(ss.elevation_deg)
-            v_dist = float(ss.distance_est)
-            v_gain = float(ss.gain)
-
         t_now = time.time()
-        fresh = v_active and ((t_now - v_last_t) <= self.vision_timeout_s)
 
-        if fresh:
-            # Convert world -> listener frame using yaw with YAW_SIGN applied (no gain)
-            # Gain is only applied in baseline head-tracking path
-            meas_az = self._wrap_deg(v_az_w - yaw_signed)
-            meas_el = float(np.clip(v_el_w - float(pitch), -90.0, 90.0))
-            meas_dist = float(v_dist)
-            meas_gain = float(v_gain)
+        for i in range(len(self.sources)):
+            with self._source_states_lock:
+                ss = self.source_states[i]
+                v_active = bool(ss.active)
+                v_last_t = float(ss.last_update_t)
+                v_az_w = float(ss.azimuth_deg)
+                v_el_w = float(ss.elevation_deg)
+                v_dist = float(ss.distance_est)
+                v_gain = float(ss.gain)
 
-            if not self._vision_was_fresh:
-                self._src_az_ema = meas_az
-                self._src_el_ema = meas_el
-                self._src_dist_ema = meas_dist
-                self._src_gain_ema = meas_gain
-                self._vision_was_fresh = True
+            fresh = v_active and ((t_now - v_last_t) <= self.vision_timeout_s)
 
-            b_az = float(VISION_CONFIG.get("smooth_beta_az", 0.20))
-            b_el = float(VISION_CONFIG.get("smooth_beta_el", 0.20))
-            b_d = float(VISION_CONFIG.get("smooth_beta_dist", 0.25))
-            b_g = float(VISION_CONFIG.get("gain_smooth_beta", 0.20))
+            if fresh:
+                meas_az = self._wrap_deg(v_az_w - yaw_signed)
+                meas_el = float(np.clip(v_el_w - float(pitch), -90.0, 90.0))
+                meas_dist = float(v_dist)
+                meas_gain = float(v_gain)
 
-            self._src_az_ema = self._ema_angle(self._src_az_ema, meas_az, b_az)
-            self._src_el_ema = (1.0 - b_el) * self._src_el_ema + b_el * meas_el
-            self._src_dist_ema = (1.0 - b_d) * self._src_dist_ema + b_d * meas_dist
-            self._src_gain_ema = (1.0 - b_g) * self._src_gain_ema + b_g * meas_gain
+                if not self._vision_was_fresh[i]:
+                    self._src_az_ema[i] = meas_az
+                    self._src_el_ema[i] = meas_el
+                    self._src_dist_ema[i] = meas_dist
+                    self._src_gain_ema[i] = meas_gain
+                    self._vision_was_fresh[i] = True
 
-        else:
-            self._vision_was_fresh = False
-            b_g = float(VISION_CONFIG.get("gain_smooth_beta", 0.20))
-            self._src_gain_ema = (1.0 - b_g) * self._src_gain_ema
+                b_az = float(VISION_CONFIG.get("smooth_beta_az", 0.20))
+                b_el = float(VISION_CONFIG.get("smooth_beta_el", 0.20))
+                b_d = float(VISION_CONFIG.get("smooth_beta_dist", 0.25))
+                b_g = float(VISION_CONFIG.get("gain_smooth_beta", 0.20))
 
-        if self._src_gain_ema > 0.02:
-            az_for_audio = self._src_az_ema
-            el_for_audio = self._src_el_ema
-            dist_for_audio = self._src_dist_ema
-            gain_for_audio = float(np.clip(self._src_gain_ema, 0.0, 1.0))
+                self._src_az_ema[i] = self._ema_angle(self._src_az_ema[i], meas_az, b_az)
+                self._src_el_ema[i] = (1.0 - b_el) * self._src_el_ema[i] + b_el * meas_el
+                self._src_dist_ema[i] = (1.0 - b_d) * self._src_dist_ema[i] + b_d * meas_dist
+                self._src_gain_ema[i] = (1.0 - b_g) * self._src_gain_ema[i] + b_g * meas_gain
 
-        if self.sources:
-            self.sources[0].set_target_position(azimuth=az_for_audio, elevation=el_for_audio, distance=dist_for_audio)
-            self.sources[0].set_target_gain(gain_for_audio)
+            else:
+                self._vision_was_fresh[i] = False
+                b_g = float(VISION_CONFIG.get("gain_smooth_beta", 0.20))
+                self._src_gain_ema[i] = (1.0 - b_g) * self._src_gain_ema[i]
+
+            if self._src_gain_ema[i] > 0.02:
+                az_for_audio = self._src_az_ema[i]
+                el_for_audio = self._src_el_ema[i]
+                dist_for_audio = self._src_dist_ema[i]
+                gain_for_audio = float(np.clip(self._src_gain_ema[i], 0.0, 1.0))
+            else:
+                az_for_audio = self.filtered_yaw
+                el_for_audio = self.filtered_pitch
+                dist_for_audio = None
+                gain_for_audio = 1.0
+
+            self.sources[i].set_target_position(azimuth=az_for_audio, elevation=el_for_audio, distance=dist_for_audio)
+            self.sources[i].set_target_gain(gain_for_audio)
 
         # Throttled debug print of audio parameters
         self._audio_print_counter += 1
         if self._audio_print_counter >= self._audio_print_interval:
             self._audio_print_counter = 0
-            dist_str = f"{dist_for_audio:.2f}m" if dist_for_audio is not None else "None"
-            print(f"[AUDIO] az={az_for_audio:7.1f}° el={el_for_audio:6.1f}° dist={dist_str} gain={gain_for_audio:.2f} fresh={fresh}")
+            for i in range(len(self.sources)):
+                ss = self.source_states[i]
+                fresh = bool(ss.active) and ((t_now - float(ss.last_update_t)) <= self.vision_timeout_s)
+                dist_for_audio = self._src_dist_ema[i] if self._src_gain_ema[i] > 0.02 else None
+                gain_for_audio = float(np.clip(self._src_gain_ema[i], 0.0, 1.0)) if self._src_gain_ema[i] > 0.02 else 1.0
+                az_for_audio = self._src_az_ema[i] if self._src_gain_ema[i] > 0.02 else self.filtered_yaw
+                el_for_audio = self._src_el_ema[i] if self._src_gain_ema[i] > 0.02 else self.filtered_pitch
+                dist_str = f"{dist_for_audio:.2f}m" if dist_for_audio is not None else "None"
+                print(f"[AUDIO] source={i} az={az_for_audio:7.1f}° el={el_for_audio:6.1f}° dist={dist_str} gain={gain_for_audio:.2f} fresh={fresh}")
 
         mixed_output = np.zeros((frames, 2), dtype=np.float32)
 
@@ -1302,7 +1267,7 @@ if __name__ == "__main__":
     print("=" * 70)
 
     try:
-        audio_files = ["rain.wav"] #, "drums.wav"]
+        audio_files = ["rain.wav", "drums.wav"]
 
         processor = SpatialAudioProcessor(
             audio_files=audio_files,
