@@ -306,9 +306,18 @@ class ObjectDetectionYOLO(threading.Thread):
         self.processor = processor
         self._stop_evt = threading.Event()
         self._frame_count = 0  # FIXED: For print throttling
+        self.video_writer = None
+        self.video_file = None
 
     def stop(self):
         self._stop_evt.set()
+    
+    def close_video_writer(self):
+        """Close the video writer if it's open."""
+        if self.video_writer is not None:
+            self.video_writer.release()
+            self.video_writer = None
+            print(f"[VISION] FPV recording closed: {self.video_file}")
 
     def _compute_vfov_deg(self, hfov_deg: float, w: int, h: int) -> float:
         """Derive VFOV from HFOV + aspect ratio."""
@@ -384,6 +393,18 @@ class ObjectDetectionYOLO(threading.Thread):
             now = time.time()
             if now < next_t:
                 if VISION_CONFIG["show_window"]:
+                    # Initialize video writer on first frame if debug window is enabled
+                    if self.video_writer is None:
+                        h, w = frame.shape[:2]
+                        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                        self.video_file = os.path.join(os.path.dirname(__file__), "vision_fpv.mp4")
+                        self.video_writer = cv2.VideoWriter(
+                            self.video_file, fourcc, 30.0, (w, h)
+                        )
+                        print(f"[VISION] Recording FPV to: {self.video_file}")
+                    
+                    # Write frame to video
+                    self.video_writer.write(frame)
                     cv2.imshow(VISION_CONFIG["window_name"], frame)
                     if (cv2.waitKey(1) & 0xFF) == ord("q"):
                         self.stop()
@@ -393,28 +414,36 @@ class ObjectDetectionYOLO(threading.Thread):
             self._frame_count += 1
 
             # YOLO inference with tracking
-            res = model.track(frame, conf=VISION_CONFIG["conf_thres"], persist=True, verbose=False)[0]
-            tracks = res
-
-            if tracks is None or len(tracks) == 0:
+            results = model.track(frame, conf=VISION_CONFIG["conf_thres"], persist=True, verbose=False)
+            
+            if results is None or len(results) == 0:
+                if VISION_CONFIG["show_window"]:
+                    cv2.imshow(VISION_CONFIG["window_name"], frame)
+                    if (cv2.waitKey(1) & 0xFF) == ord("q"):
+                        self.stop()
+                continue
+            
+            res = results[0]
+            
+            if res.boxes is None or len(res.boxes) == 0:
                 if VISION_CONFIG["show_window"]:
                     cv2.imshow(VISION_CONFIG["window_name"], res.plot())
                     if (cv2.waitKey(1) & 0xFF) == ord("q"):
                         self.stop()
                 continue
 
-            # Process each track
-            for track in tracks:
-                cls_id = int(track.cls)
+            # Process each tracked detection
+            for detection in res.boxes:
+                cls_id = int(detection.cls)
                 cls_name = names.get(cls_id, str(cls_id))
-                if cls_name != "person" or track.id is None:
+                if cls_name != "person" or detection.id is None:
                     continue
-                person_id = int(track.id)
+                person_id = int(detection.id)
                 source_id = person_id - 1  # ID 1 -> source 0, ID 2 -> source 1, etc.
                 if source_id >= len(self.processor.sources):
                     continue
 
-                x1, y1, x2, y2 = track.xyxy.cpu().numpy()
+                x1, y1, x2, y2 = detection.xyxy[0].cpu().numpy()
                 cx = 0.5 * (x1 + x2)
                 cy = 0.5 * (y1 + y2)
                 H, W = frame.shape[:2]
@@ -425,7 +454,7 @@ class ObjectDetectionYOLO(threading.Thread):
                 el_deg = -ny * (vfov_deg / 2.0)
 
                 roll, pitch, yaw = self.processor.imu.get_euler()
-                conf = float(track.conf.cpu().numpy())
+                conf = float(detection.conf.cpu().numpy())
                 dist_m = self._estimate_distance_m(x1, y1, x2, y2, cls_name, W, H)
                 t_vision = time.time()
 
@@ -440,13 +469,33 @@ class ObjectDetectionYOLO(threading.Thread):
                     print(f"[VISION] personID={person_id} source={source_id} conf={conf:.2f} az_deg={az_deg:.1f} el_deg={el_deg:.1f} dist_m={dist_m:.2f}")
 
             if VISION_CONFIG["show_window"]:
-                cv2.imshow(VISION_CONFIG["window_name"], res.plot())
+                annotated_frame = res.plot()
+                
+                # Initialize video writer if not already done
+                if self.video_writer is None:
+                    h, w = annotated_frame.shape[:2]
+                    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                    self.video_file = os.path.join(os.path.dirname(__file__), "vision_fpv.mp4")
+                    self.video_writer = cv2.VideoWriter(
+                        self.video_file, fourcc, 30.0, (w, h)
+                    )
+                    print(f"[VISION] Recording FPV to: {self.video_file}")
+                
+                # Write frame to video
+                self.video_writer.write(annotated_frame)
+                cv2.imshow(VISION_CONFIG["window_name"], annotated_frame)
                 if (cv2.waitKey(1) & 0xFF) == ord("q"):
                     self.stop()
 
         cap.release()
         if VISION_CONFIG["show_window"]:
             cv2.destroyWindow(VISION_CONFIG["window_name"])
+        
+        # Close video writer if it was initialized
+        if self.video_writer is not None:
+            self.video_writer.release()
+            print(f"[VISION] FPV recording saved: {self.video_file}")
+        
         print("[VISION] Stopped.")
 
 
@@ -1321,6 +1370,14 @@ if __name__ == "__main__":
                         VISION_CONFIG["show_window"] = not VISION_CONFIG["show_window"]
                         state = "ON" if VISION_CONFIG["show_window"] else "OFF"
                         print(f"[CTRL] YOLO debug display: {state}")
+                        if not VISION_CONFIG["show_window"]:
+                            # Close video writer when debug window is turned off
+                            try:
+                                vt = ctl.get("vision")
+                                if vt is not None and hasattr(vt, 'close_video_writer'):
+                                    vt.close_video_writer()
+                            except Exception:
+                                pass
                     elif cmd == "v":
                         vt = ctl.get("vision")
                         if vt is None or not vt.is_alive():
@@ -1334,6 +1391,7 @@ if __name__ == "__main__":
                         else:
                             try:
                                 vt.stop()
+                                vt.close_video_writer()
                                 vt.join(timeout=2.0)
                             except Exception:
                                 pass
@@ -1360,6 +1418,7 @@ if __name__ == "__main__":
                     except Exception:
                         vt = None
                     if vt is not None:
+                        vt.close_video_writer()
                         vt.stop()
                         vt.join(timeout=2.0)
                 except Exception:
