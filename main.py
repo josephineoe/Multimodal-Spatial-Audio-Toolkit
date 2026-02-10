@@ -19,41 +19,100 @@ from dataclasses import dataclass
 
 
 class DebugLogger:
-    """Lightweight CSV logger (safe to call from background threads)."""
+    """Lightweight CSV logger (safe to call from background threads). Logging is disabled by default."""
 
     def __init__(self, debug_dir: str):
         os.makedirs(debug_dir, exist_ok=True)
 
         self._lock = threading.Lock()
-        self._vision_fp = open(os.path.join(debug_dir, "vision_log.csv"), "w", newline="")
-        self._vision_w = csv.writer(self._vision_fp)
-        self._vision_w.writerow(["t", "az_cam_deg", "el_cam_deg", "dist_m", "conf", "cls_name"])
+        self._enabled = False
+        self._debug_dir = debug_dir
+        self._vision_fp = None
+        self._vision_w = None
+        self._imu_fp = None
+        self._imu_w = None
 
-        self._imu_fp = open(os.path.join(debug_dir, "imu_log.csv"), "w", newline="")
-        self._imu_w = csv.writer(self._imu_fp)
-        self._imu_w.writerow(["t", "qw", "qx", "qy", "qz", "roll_deg", "pitch_deg", "yaw_deg"])
-
-    def log_vision(self, t, az_deg, el_deg, dist_m, conf, cls_name):
+    def enable(self):
+        """Enable logging and open CSV files."""
         with self._lock:
-            self._vision_w.writerow([float(t), float(az_deg), float(el_deg), float(dist_m),
-                                     float(conf) if conf is not None else 0.0, str(cls_name) if cls_name else ""])
-            self._vision_fp.flush()
+            if self._enabled:
+                return
+            self._enabled = True
+            try:
+                self._vision_fp = open(os.path.join(self._debug_dir, "vision_log.csv"), "w", newline="")
+                self._vision_w = csv.writer(self._vision_fp)
+                self._vision_w.writerow(["timestamp", "az_cam_deg", "el_cam_deg", "dist_m", "conf", "cls_name", "latency_ms"])
+                self._vision_fp.flush()
 
-    def log_imu(self, t, qw, qx, qy, qz, roll, pitch, yaw):
+                self._imu_fp = open(os.path.join(self._debug_dir, "imu_log.csv"), "w", newline="")
+                self._imu_w = csv.writer(self._imu_fp)
+                self._imu_w.writerow(["timestamp", "qw", "qx", "qy", "qz", "roll_deg", "pitch_deg", "yaw_deg", "latency_ms"])
+                self._imu_fp.flush()
+            except Exception as e:
+                print(f"[DEBUG] Error enabling logging: {e}")
+                self._enabled = False
+
+    def disable(self):
+        """Disable logging and close CSV files."""
         with self._lock:
-            self._imu_w.writerow([float(t), float(qw), float(qx), float(qy), float(qz),
-                                  float(roll), float(pitch), float(yaw)])
-            self._imu_fp.flush()
+            if not self._enabled:
+                return
+            self._enabled = False
+            try:
+                if self._vision_fp:
+                    self._vision_fp.close()
+                if self._imu_fp:
+                    self._imu_fp.close()
+            except Exception:
+                pass
+            self._vision_fp = None
+            self._vision_w = None
+            self._imu_fp = None
+            self._imu_w = None
+
+    def log_vision(self, t, az_deg, el_deg, dist_m, conf, cls_name, t_vision):
+        """Log vision data with latency calculation."""
+        with self._lock:
+            if not self._enabled or self._vision_w is None:
+                return
+            try:
+                latency_ms = (time.time() - float(t_vision)) * 1000.0
+                self._vision_w.writerow([float(t), float(az_deg), float(el_deg), float(dist_m),
+                                         float(conf) if conf is not None else 0.0, str(cls_name) if cls_name else "", float(latency_ms)])
+                self._vision_fp.flush()
+            except Exception:
+                pass
+
+    def log_imu(self, t, qw, qx, qy, qz, roll, pitch, yaw, t_send):
+        """Log IMU data with latency calculation."""
+        with self._lock:
+            if not self._enabled or self._imu_w is None:
+                return
+            try:
+                latency_ms = (time.time() - float(t_send)) * 1000.0
+                self._imu_w.writerow([float(t), float(qw), float(qx), float(qy), float(qz),
+                                      float(roll), float(pitch), float(yaw), float(latency_ms)])
+                self._imu_fp.flush()
+            except Exception:
+                pass
 
     def close(self):
-        try:
-            self._vision_fp.close()
-        except Exception:
-            pass
-        try:
-            self._imu_fp.close()
-        except Exception:
-            pass
+        """Close all open files."""
+        with self._lock:
+            try:
+                if self._vision_fp:
+                    self._vision_fp.close()
+            except Exception:
+                pass
+            try:
+                if self._imu_fp:
+                    self._imu_fp.close()
+            except Exception:
+                pass
+            self._vision_fp = None
+            self._vision_w = None
+            self._imu_fp = None
+            self._imu_w = None
 
 
 @dataclass
@@ -90,7 +149,7 @@ VISION_CONFIG = {
     "use_mjpeg": True,
 
     # YOLO
-    "model_path": "yolov8n.pt",
+    "model_path": "yolov11n.pt",
     "conf_thres": 0.25,
     "infer_hz": 8.0,            # FIXED: Reduced from 10 to 8 Hz for stability
 
@@ -603,7 +662,7 @@ class HeadTrackingReceiver:
 
                 if self.logger:
                     roll, pitch, yaw = self.get_euler()
-                    self.logger.log_imu(time.time(), qw, qx, qy, qz, roll, pitch, yaw)
+                    self.logger.log_imu(time.time(), qw, qx, qy, qz, roll, pitch, yaw, t_send)
 
             except Exception:
                 # Ignore malformed/empty packets
@@ -699,20 +758,13 @@ class SpatialAudioProcessor:
         self.sample_rate = sample_rate
         self.buffer_size = 4096
 
-        # FIXED: Move latency logging off callback thread
-        self.latency_log_queue = []  # Store latency data for batch writing
-        debug_dir = os.path.join(os.path.dirname(__file__), "debug_logs")
-        os.makedirs(debug_dir, exist_ok=True)
-        latency_csv_path = os.path.join(debug_dir, "latency_final_aar_audio.csv")
-        self.latency_log = open(latency_csv_path, "w", newline="")
-        self.latency_writer = csv.writer(self.latency_log)
-        self.latency_writer.writerow(["timestamp", "latency_ms"])
-
         # Throttled audio params print
         self._audio_print_counter = 0
         self._audio_print_interval = 50  # Print every N callbacks (~1 sec at 4096 buffer)
 
-        # Debug logger (vision + IMU)
+        # Debug logger (vision + IMU) - disabled by default, enabled when recording starts
+        debug_dir = os.path.join(os.path.dirname(__file__), "debug_logs")
+        os.makedirs(debug_dir, exist_ok=True)
         self.logger = DebugLogger(debug_dir)
 
         # Head tracking receiver
@@ -865,7 +917,7 @@ class SpatialAudioProcessor:
 
         # Log vision data (off callback thread)
         try:
-            self.logger.log_vision(t, azimuth_deg, elevation_deg, d, c, cname)
+            self.logger.log_vision(t, azimuth_deg, elevation_deg, d, c, cname, t)
         except Exception:
             pass
 
@@ -1033,17 +1085,6 @@ class SpatialAudioProcessor:
         if not self._audio_ready:
             outdata[:] = np.zeros((frames, 2), dtype=np.float32)
             return
-        
-        t_now = time.time()
-        t_send = self.imu.t_send
-
-        if t_send > 0:
-            latency_ms = (t_now - t_send) * 1000.0
-            self.latency_log_queue.append([t_now, latency_ms])
-
-            if len(self.latency_log_queue) >= 100:
-                self.latency_writer.writerows(self.latency_log_queue)
-                self.latency_log_queue.clear()
 
         if status:
             print(f"Audio status: {status}")
@@ -1076,6 +1117,7 @@ class SpatialAudioProcessor:
             v_dist = float(ss.distance_est)
             v_gain = float(ss.gain)
 
+        t_now = time.time()
         fresh = v_active and ((t_now - v_last_t) <= self.vision_timeout_s)
 
         if fresh:
@@ -1195,15 +1237,6 @@ class SpatialAudioProcessor:
             self.stream.stop()
             self.stream.close()
 
-        if self.latency_log_queue:
-            self.latency_writer.writerows(self.latency_log_queue)
-            self.latency_log_queue.clear()
-
-        try:
-            self.latency_log.close()
-        except Exception:
-            pass
-
         self.is_playing = False
 
         if self.is_recording:
@@ -1217,7 +1250,7 @@ class SpatialAudioProcessor:
         print("\nPlayback stopped")
 
     def start_recording(self):
-        """Start recording the mixed spatial audio output."""
+        """Start recording the mixed spatial audio output and enable debug logging."""
         if not self.is_playing:
             print("Cannot record - playback not active")
             return
@@ -1225,14 +1258,22 @@ class SpatialAudioProcessor:
         self.is_recording = True
         self.recorded_frames = []
         self.recording_duration = 0.0
+        
+        # Enable debug logging when recording starts
+        self.logger.enable()
+        
         print("\n🔴 RECORDING STARTED")
+        print("   Debug logging enabled (IMU and vision)")
 
     def stop_recording(self, filename="spatial_audio_output.wav"):
-        """Stop recording and save to WAV file."""
+        """Stop recording and save to WAV file. Disable debug logging."""
         if not self.is_recording:
             return
 
         self.is_recording = False
+        
+        # Disable debug logging when recording stops
+        self.logger.disable()
 
         if len(self.recorded_frames) == 0:
             print("No audio recorded")
