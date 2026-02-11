@@ -1,7 +1,10 @@
 # ============================================================================
-# MULTIMODAL SPATIAL AUDIO TOOLKIT - PHASE 3.5
+# MULTIMODAL SPATIAL AUDIO TOOLKIT - PHASE 4
 # Head-tracked HRTF spatial audio with real-time vision-driven source control
 # ============================================================================
+
+#notes: imu isnt logging
+#the video did not record fully
 
 import socket
 import threading
