@@ -924,3 +924,85 @@ class SpatialAudioProcessor:
         print(f"✅ Offline render complete: {output_file}")
         print(f"   Duration: {duration_seconds:.2f}s")
         print(f"   Sample rate: {self.sample_rate}Hz")
+
+
+if __name__ == "__main__":
+    """
+    Test HRTF module independently.
+    Checks SOFA loading, IMU initialization, and audio source setup.
+    """
+    print("=" * 70)
+    print("HRTF MODULE TEST")
+    print("=" * 70)
+    print()
+    
+    try:
+        # Test SOFA file
+        print("Testing SOFA HRTF file...")
+        sofa_file = "MIT_KEMAR_normal_pinna.sofa"
+        if os.path.exists(sofa_file):
+            print(f"✅ SOFA file found: {sofa_file}")
+        else:
+            print(f"❌ SOFA file not found: {sofa_file}")
+        
+        # Test audio files
+        print()
+        print("Testing audio files...")
+        audio_files = ["rain.wav", "drums.wav"]
+        for af in audio_files:
+            if os.path.exists(af):
+                try:
+                    data, sr = sf.read(af)
+                    duration = len(data) / sr
+                    print(f"✅ {af}: {sr}Hz, {duration:.1f}s")
+                except Exception as e:
+                    print(f"❌ {af}: {e}")
+            else:
+                print(f"❌ {af}: File not found")
+        
+        # Initialize processor (without vision config for testing)
+        print()
+        print("Initializing audio processor...")
+        processor = SpatialAudioProcessor(
+            audio_files=audio_files,
+            sofa_file=sofa_file,
+            sample_rate=44100,
+            imu_port=5005,
+            vision_config={}
+        )
+        print("✅ Processor initialized successfully")
+        
+        # Test IMU receiver
+        print()
+        print("IMU Receiver Status:")
+        print(f"  Listening on port 5005")
+        print(f"  Current quaternion: qw={processor.imu.qw:.3f}, qx={processor.imu.qx:.3f}, "
+              f"qy={processor.imu.qy:.3f}, qz={processor.imu.qz:.3f}")
+        roll, pitch, yaw = processor.imu.get_euler()
+        print(f"  Current Euler: roll={roll:.1f}°, pitch={pitch:.1f}°, yaw={yaw:.1f}°")
+        if processor.imu.t_send == 0.0:
+            print("  ⚠️  IMU not responding yet (waiting for UDP data)")
+        else:
+            print("  ✅ IMU is responding")
+        
+        # Summary
+        print()
+        print(f"Audio Sources:")
+        for i, src in enumerate(processor.sources):
+            print(f"  Source {i}: {src.audio_file} ({len(src.audio_data) / processor.sample_rate:.1f}s)")
+        
+        print()
+        print("HRTF Module Summary:")
+        print(f"  ✅ SOFA loaded: {processor.hrir_data.shape[0]} measurements")
+        print(f"  ✅ Audio sources: {len(processor.sources)}")
+        print(f"  ✅ HRIR length: {processor.hrir_length} samples")
+        print()
+        print("HRTF module is ready for testing with main.py")
+        print("\nTo test with IMU data:")
+        print("  - Send quaternion packets via UDP on port 5005")
+        print("  - Format: t_send,qw,qx,qy,qz (CSV or labeled text)")
+        
+    except Exception as e:
+        print(f"❌ HRTF test failed: {e}")
+        import traceback
+        traceback.print_exc()

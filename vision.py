@@ -345,3 +345,183 @@ class ObjectDetectionYOLO(threading.Thread):
             cv2.destroyWindow(VISION_CONFIG["window_name"])
         
         print("[VISION] Stopped.")
+
+
+def start_and_test_vision(processor):
+    """
+    Start vision thread and test object detection.
+    Independently callable for testing purposes.
+    """
+    print("\n" + "=" * 70)
+    print("VISION THREAD - START AND TEST")
+    print("=" * 70)
+    print()
+    print("Vision Configuration:")
+    print(f"  Camera Source: {VISION_CONFIG['camera_source']}")
+    print(f"  Resolution: {VISION_CONFIG['width']}x{VISION_CONFIG['height']}")
+    print(f"  FPS: {VISION_CONFIG['fps']}")
+    print(f"  Model: {VISION_CONFIG['model_path']}")
+    print(f"  Confidence Threshold: {VISION_CONFIG['conf_thres']}")
+    print(f"  Inference Rate: {VISION_CONFIG['infer_hz']} Hz")
+    print()
+    
+    try:
+        vision_thread = ObjectDetectionYOLO(processor)
+        vision_thread.start()
+        print(f"[VISION] Thread started successfully: {vision_thread.is_alive()}")
+        return vision_thread
+    except Exception as e:
+        print(f"[VISION] Error starting vision thread: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+
+if __name__ == "__main__":
+    """
+    Test vision module independently.
+    Checks camera access and YOLO model availability.
+    """
+    print("=" * 70)
+    print("VISION MODULE TEST")
+    print("=" * 70)
+    print()
+    print("Vision Configuration:")
+    print(f"  Camera Source: {VISION_CONFIG['camera_source']}")
+    print(f"  Resolution: {VISION_CONFIG['width']}x{VISION_CONFIG['height']}")
+    print(f"  FPS: {VISION_CONFIG['fps']}")
+    print(f"  Model: {VISION_CONFIG['model_path']}")
+    print(f"  Confidence Threshold: {VISION_CONFIG['conf_thres']}")
+    print(f"  Inference Rate: {VISION_CONFIG['infer_hz']} Hz")
+    print()
+    
+    # Test camera access
+    print("Testing camera access...")
+    try:
+        import cv2
+        cap = _open_camera_for_vision()
+        if cap.isOpened():
+            print("✅ Camera opened successfully")
+            _freeze_camera_settings(cap)
+            # Try to read one frame
+            ret, frame = cap.read()
+            if ret:
+                print(f"✅ Frame captured: {frame.shape}")
+            else:
+                print("⚠️  Could not read frame")
+            cap.release()
+        else:
+            print("❌ Could not open camera")
+    except Exception as e:
+        print(f"❌ Camera test failed: {e}")
+    
+    # Test YOLO model
+    print()
+    print("Testing YOLO model...")
+    try:
+        from ultralytics import YOLO
+        import os
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        model_path = os.path.join(script_dir, VISION_CONFIG["model_path"])
+        if os.path.exists(model_path):
+            print(f"✅ Model file found: {model_path}")
+            model = YOLO(model_path)
+            print(f"✅ Model loaded successfully")
+            print(f"   Classes: {len(model.names)}")
+        else:
+            print(f"❌ Model file not found: {model_path}")
+    except Exception as e:
+        print(f"❌ YOLO test failed: {e}")
+    
+    print()
+    print("Vision module is ready for testing with main.py")
+
+
+def start_and_test_vision(processor):
+    """
+    Start vision thread and test object detection.
+    Independently callable for testing purposes.
+    """
+    print("\n" + "=" * 70)
+    print("VISION THREAD - START AND TEST")
+    print("=" * 70)
+    print()
+    print("Vision Configuration:")
+    print(f"  Camera Source: {VISION_CONFIG['camera_source']}")
+    print(f"  Resolution: {VISION_CONFIG['width']}x{VISION_CONFIG['height']}")
+    print(f"  FPS: {VISION_CONFIG['fps']}")
+    print(f"  Model: {VISION_CONFIG['model_path']}")
+    print(f"  Confidence Threshold: {VISION_CONFIG['conf_thres']}")
+    print(f"  Inference Rate: {VISION_CONFIG['infer_hz']} Hz")
+    print()
+    
+    try:
+        vision_thread = ObjectDetectionYOLO(processor)
+        vision_thread.start()
+        print(f"[VISION] Thread started successfully: {vision_thread.is_alive()}")
+        return vision_thread
+    except Exception as e:
+        print(f"[VISION] Error starting vision thread: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+
+if __name__ == "__main__":
+    """
+    Test vision module independently.
+    Checks camera access and YOLO model availability.
+    """
+    print("=" * 70)
+    print("VISION MODULE TEST")
+    print("=" * 70)
+    print()
+    print("Vision Configuration:")
+    print(f"  Camera Source: {VISION_CONFIG['camera_source']}")
+    print(f"  Resolution: {VISION_CONFIG['width']}x{VISION_CONFIG['height']}")
+    print(f"  FPS: {VISION_CONFIG['fps']}")
+    print(f"  Model: {VISION_CONFIG['model_path']}")
+    print(f"  Confidence Threshold: {VISION_CONFIG['conf_thres']}")
+    print(f"  Inference Rate: {VISION_CONFIG['infer_hz']} Hz")
+    print()
+    
+    # Test camera access
+    print("Testing camera access...")
+    try:
+        import cv2
+        cap = _open_camera_for_vision()
+        if cap.isOpened():
+            print("✅ Camera opened successfully")
+            _freeze_camera_settings(cap)
+            # Try to read one frame
+            ret, frame = cap.read()
+            if ret:
+                print(f"✅ Frame captured: {frame.shape}")
+            else:
+                print("⚠️  Could not read frame")
+            cap.release()
+        else:
+            print("❌ Could not open camera")
+    except Exception as e:
+        print(f"❌ Camera test failed: {e}")
+    
+    # Test YOLO model
+    print()
+    print("Testing YOLO model...")
+    try:
+        from ultralytics import YOLO
+        import os
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        model_path = os.path.join(script_dir, VISION_CONFIG["model_path"])
+        if os.path.exists(model_path):
+            print(f"✅ Model file found: {model_path}")
+            model = YOLO(model_path)
+            print(f"✅ Model loaded successfully")
+            print(f"   Classes: {len(model.names)}")
+        else:
+            print(f"❌ Model file not found: {model_path}")
+    except Exception as e:
+        print(f"❌ YOLO test failed: {e}")
+    
+    print()
+    print("Vision module is ready for testing with main.py")

@@ -9,7 +9,7 @@ import os
 
 # Import modules
 from hrtf import SpatialAudioProcessor
-from vision import ObjectDetectionYOLO, VISION_CONFIG
+from vision import ObjectDetectionYOLO, VISION_CONFIG, start_and_test_vision
 
 
 def main():
@@ -54,9 +54,7 @@ def main():
             processor.start_playback()
 
             # Start vision thread
-            vision_thread = ObjectDetectionYOLO(processor)
-            vision_thread.start()
-            print("[MAIN] Vision thread started:", vision_thread.is_alive())
+            vision_thread = start_and_test_vision(processor)
 
             # Simple interactive controls
             control_state = {"vision": vision_thread}
