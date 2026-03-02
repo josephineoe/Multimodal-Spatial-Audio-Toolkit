@@ -75,7 +75,11 @@ def main():
                     elif cmd == "d":
                         VISION_CONFIG["show_window"] = not VISION_CONFIG["show_window"]
                         state = "ON" if VISION_CONFIG["show_window"] else "OFF"
-                        print(f"[CTRL] YOLO debug display: {state}")
+                        print(f"[CTRL] 📷 Webcam POV debug display: {state}")
+                        if VISION_CONFIG["show_window"]:
+                            print(f"      Opening camera feed with object detections...")
+                        else:
+                            print(f"      Closing camera feed window.")
                     elif cmd == "v":
                         vt = control_state.get("vision")
                         if vt is None or not vt.is_alive():

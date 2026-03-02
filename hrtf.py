@@ -684,6 +684,10 @@ class SpatialAudioProcessor:
 
         t_now = time.time()
 
+        # First pass: collect fresh detection states (non-blocking read)
+        fresh_detections = []
+        source_states_snapshot = []
+        
         for i in range(len(self.sources)):
             with self._source_states_lock:
                 ss = self.source_states[i]
@@ -695,8 +699,29 @@ class SpatialAudioProcessor:
                 v_gain = float(ss.gain)
 
             fresh = v_active and ((t_now - v_last_t) <= self.vision_timeout_s)
+            source_states_snapshot.append({
+                'index': i,
+                'fresh': fresh,
+                'az_w': v_az_w,
+                'el_w': v_el_w,
+                'dist': v_dist,
+                'gain': v_gain
+            })
+            if fresh:
+                fresh_detections.append(i)
+
+        # Second pass: apply/update audio parameters (fully independent per source)
+        # Head-tracking is ALWAYS the base spatial reference
+        for src_state in source_states_snapshot:
+            i = src_state['index']
+            fresh = src_state['fresh']
+            v_az_w = src_state['az_w']
+            v_el_w = src_state['el_w']
+            v_dist = src_state['dist']
+            v_gain = src_state['gain']
 
             if fresh:
+                # Source is being detected: vision MODULATES the head-tracked position
                 meas_az = self._wrap_deg(v_az_w - yaw_signed)
                 meas_el = float(np.clip(v_el_w - float(pitch), -90.0, 90.0))
                 meas_dist = float(v_dist)
@@ -709,6 +734,7 @@ class SpatialAudioProcessor:
                     self._src_gain_ema[i] = meas_gain
                     self._vision_was_fresh[i] = True
 
+                # Apply smoothing
                 b_az = float(self.vision_config.get("smooth_beta_az", 0.20))
                 b_el = float(self.vision_config.get("smooth_beta_el", 0.20))
                 b_d = float(self.vision_config.get("smooth_beta_dist", 0.25))
@@ -719,21 +745,19 @@ class SpatialAudioProcessor:
                 self._src_dist_ema[i] = (1.0 - b_d) * self._src_dist_ema[i] + b_d * meas_dist
                 self._src_gain_ema[i] = (1.0 - b_g) * self._src_gain_ema[i] + b_g * meas_gain
 
-            else:
-                self._vision_was_fresh[i] = False
-                b_g = float(self.vision_config.get("gain_smooth_beta", 0.20))
-                self._src_gain_ema[i] = (1.0 - b_g) * self._src_gain_ema[i]
-
-            if self._src_gain_ema[i] > 0.02:
+                # Use vision-tracked parameters
                 az_for_audio = self._src_az_ema[i]
                 el_for_audio = self._src_el_ema[i]
                 dist_for_audio = self._src_dist_ema[i]
                 gain_for_audio = float(np.clip(self._src_gain_ema[i], 0.0, 1.0))
+
             else:
+                # Source is NOT being detected: use head-tracking (ALWAYS the base)
+                self._vision_was_fresh[i] = False
                 az_for_audio = self.filtered_yaw
                 el_for_audio = self.filtered_pitch
                 dist_for_audio = None
-                gain_for_audio = 1.0
+                gain_for_audio = 1.0  # Always full gain for head-tracked audio
 
             self.sources[i].set_target_position(azimuth=az_for_audio, elevation=el_for_audio, distance=dist_for_audio)
             self.sources[i].set_target_gain(gain_for_audio)
