@@ -9,7 +9,6 @@ import time
 import csv
 import os
 import math
-
 import numpy as np
 import soundfile as sf
 import sounddevice as sd
@@ -135,7 +134,6 @@ class SourceState:
 # IMU Sign Convention
 # =========================================================
 YAW_SIGN = -1
-
 
 # =========================================================
 # HeadTrackingReceiver: IMU / Quaternion receiver
