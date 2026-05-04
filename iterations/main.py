@@ -12,10 +12,6 @@ from hrtf import SpatialAudioProcessor
 from vision import ObjectDetectionYOLO, VISION_CONFIG, start_and_test_vision
 
 
-# Enable HRTF/audio processing by default unless overridden externally.
-ENABLE_HRTF = True
-
-
 def main():
     """Main entry point: Setup and orchestration."""
     print("=" * 70)
@@ -24,20 +20,17 @@ def main():
     print("=" * 70)
 
     try:
+        # Audio files
         audio_files = ["rain.wav", "drums.wav"]
 
-        processor = None
-        if ENABLE_HRTF:
-            from hrtf import SpatialAudioProcessor
-            processor = SpatialAudioProcessor(
-                audio_files=audio_files,
-                sofa_file="MIT_KEMAR_normal_pinna.sofa",
-                sample_rate=44100,
-                imu_port=5005,
-                vision_config=VISION_CONFIG
-            )
-        else:
-            print("[MAIN] HRTF/audio processing is DISABLED.")
+        # Initialize audio processor with vision config
+        processor = SpatialAudioProcessor(
+            audio_files=audio_files,
+            sofa_file="MIT_KEMAR_normal_pinna.sofa",
+            sample_rate=44100,
+            imu_port=5005,
+            vision_config=VISION_CONFIG
+        )
 
         # Ask user for mode
         mode = input(
@@ -47,7 +40,8 @@ def main():
             "Choice (1/2): "
         ).strip()
 
-        if mode == "2" and ENABLE_HRTF:
+        if mode == "2":
+            # Offline render mode
             duration = input("Offline render duration in seconds (default 5): ").strip()
             try:
                 duration = float(duration)
@@ -56,11 +50,10 @@ def main():
             processor.export_offline_render(duration_seconds=duration)
 
         else:
-            # Only start playback if HRTF is enabled
-            if ENABLE_HRTF:
-                processor.start_playback()
+            # Real-time playback mode with vision
+            processor.start_playback()
 
-            # Start vision thread (can pass None if processor is not needed)
+            # Start vision thread
             vision_thread = start_and_test_vision(processor)
 
             # Simple interactive controls
@@ -78,10 +71,7 @@ def main():
                         return
 
                     if cmd == "r":
-                        if ENABLE_HRTF:
-                            processor.toggle_recording()
-                        else:
-                            print("[CTRL] Recording unavailable (HRTF disabled).")
+                        processor.toggle_recording()
                     elif cmd == "d":
                         VISION_CONFIG["show_window"] = not VISION_CONFIG["show_window"]
                         state = "ON" if VISION_CONFIG["show_window"] else "OFF"
@@ -133,8 +123,7 @@ def main():
                     pass
 
                 try:
-                    if ENABLE_HRTF:
-                        processor.stop_playback()
+                    processor.stop_playback()
                 except Exception:
                     pass
 

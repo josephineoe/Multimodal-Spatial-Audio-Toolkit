@@ -305,11 +305,6 @@ class ObjectDetectionYOLO(threading.Thread):
                 if cls_name != "person" or detection.id is None:
                     continue
                 person_id = int(detection.id)
-                
-                # Only proceed with audio updates if processor is available
-                if self.processor is None:
-                    continue
-                
                 source_id = person_id - 1  # ID 1 -> source 0, ID 2 -> source 1, etc.
                 if source_id >= len(self.processor.sources):
                     continue
