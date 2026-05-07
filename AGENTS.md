@@ -1,8 +1,8 @@
 # AI Coding Agent Instructions
 
 ## Change Tracking
-- **All code changes must be recorded in `CHANGELOG.md` at the project root.**
-- Each entry should include the date, a brief summary of the change, and the files affected.
+- **All code changes, library installations, and supporting environment changes must be recorded in `CHANGELOG.md` at the project root.**
+- Each entry should include the date and timestamp, a brief summary of the change, the files affected, and any new or updated dependencies or environment setup steps.
 - If a change is minor (e.g., typo fix), it can be grouped with other small changes for the day.
 
 ## Documentation Reference
