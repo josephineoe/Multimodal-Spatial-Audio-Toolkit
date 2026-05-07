@@ -1,4 +1,24 @@
 # Real-Time Spatial Perception Stack
+
+---
+
+## Project Author & Roles
+
+This project was designed, implemented, and documented end-to-end by a single contributor (josephineoe), whose responsibilities span multiple industry-standard roles:
+
+- **Principal Investigator / Project Lead:** Overall vision, architecture, and direction.
+- **Software Engineer (Full Stack):** Designed and implemented all core modules (audio, vision, IMU, timing, orchestration).
+- **Machine Learning Engineer:** Integrated and configured YOLO object detection for real-time vision.
+- **Embedded Systems Engineer:** Managed IMU data acquisition and real-time sensor fusion.
+- **Audio DSP Engineer:** Developed HRTF spatialization, SOFA file handling, and real-time audio processing.
+- **DevOps / Build Engineer:** Set up dependencies, runtime scripts, and ensured cross-platform operability.
+- **Technical Writer:** Authored all documentation, including README, configuration, and usage instructions.
+- **QA / Test Engineer:** Validated module functionality, debugged, and ensured system reliability.
+
+This makes the author the equivalent of a "Technical Founder" or "Lead Systems Architect" in industry terms, responsible for end-to-end design, implementation, and delivery.
+
+---
+
 ### IMU-Driven HRTF Audio with Camera-Based Object Detection
 
 A real-time perception system that maps the physical environment into 3D spatial audio. An IMU streams head orientation as quaternions over UDP; a camera runs YOLO inference to detect and localize objects; the two streams are fused in real time and used to drive HRTF-spatialized audio, so each detected object produces a binaural sound anchored to its position in the world.
@@ -80,11 +100,15 @@ Distance feeds a gain curve that attenuates audio with distance (`gain ∝ ref_d
 
 ## Modules
 
-| File | Responsibility |
-|---|---|
-| `hrtf.py` | `HeadTrackingReceiver` — UDP IMU listener; `SpatialAudioSource` — per-source audio state; `SpatialAudioProcessor` — SOFA loading, HRTF lookup, OLA convolution, sensor fusion, recording |
-| `vision.py` | `ObjectDetectionYOLO` — camera capture + YOLOv11n inference thread; pixel-to-angle projection; distance estimation; `VISION_CONFIG` — all tunable parameters |
-| `main.py` | Orchestrator: wires processor ↔ vision thread, provides interactive CLI (record, toggle vision, debug window, quit) |
+| File         | Responsibility |
+|--------------|-----------------------------------------------------------------------------------------------|
+| `main.py`    | Orchestrator: CLI, coordinates audio (HRTF), vision, and head-tracking subsystems.            |
+| `hrtf.py`    | `SpatialAudioProcessor` — HRTF spatialization, SOFA loading, OLA convolution, sensor fusion;  |
+|              | `SpatialAudioSource` — per-source audio state; `DebugLogger` — CSV logging.                   |
+| `vision.py`  | `ObjectDetectionYOLO` — camera capture, YOLOv11n inference, distance estimation;              |
+|              | `VISION_CONFIG` — all tunable parameters.                                                     |
+| `imu.py`     | `HeadTrackingReceiver` — UDP IMU listener, quaternion parsing, Euler angle conversion.        |
+| `timing.py`  | `SystemClock` — unified timing reference for all modules, latency measurement utilities.      |
 
 ---
 
