@@ -10,6 +10,9 @@ import math
 
 import numpy as np
 
+# Import timing module for unified clock
+from timing import system_clock
+
 
 # =========================================================
 # Vision Configuration
@@ -92,22 +95,33 @@ VISION_CONFIG = {
 
 def _open_camera_for_vision():
     """Open camera source based on configuration."""
-    import cv2
-
+    try:
+        import cv2
+    except ImportError as e:
+        print(f"[VISION][ERR] Failed to import cv2: {e}")
+        return None
+    
     src = VISION_CONFIG["camera_source"]
-    if src == "default":
-        cap = cv2.VideoCapture(0)
-    elif src == "usb":
-        cap = cv2.VideoCapture("/dev/video0", cv2.CAP_V4L2)
-    elif src == "gstreamer":
-        gst = VISION_CONFIG["gst_pipeline"]
-        if not gst:
-            raise ValueError("VISION_CONFIG['gst_pipeline'] is empty.")
-        cap = cv2.VideoCapture(gst, cv2.CAP_GSTREAMER)
-    else:
-        raise ValueError(f"Unknown VISION_CONFIG['camera_source']: {src}")
-
-    return cap
+    try:
+        if src == "default":
+            # Try DirectShow backend first (more reliable on Windows)
+            cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+            if not cap.isOpened():
+                print("[VISION] DirectShow failed, trying MSMF...")
+                cap = cv2.VideoCapture(0, cv2.CAP_MSMF)
+        elif src == "usb":
+            cap = cv2.VideoCapture("/dev/video0", cv2.CAP_V4L2)
+        elif src == "gstreamer":
+            gst = VISION_CONFIG["gst_pipeline"]
+            if not gst:
+                raise ValueError("VISION_CONFIG['gst_pipeline'] is empty.")
+            cap = cv2.VideoCapture(gst, cv2.CAP_GSTREAMER)
+        else:
+            raise ValueError(f"Unknown VISION_CONFIG['camera_source']: {src}")
+        return cap
+    except Exception as e:
+        print(f"[VISION][ERR] Failed to open camera: {e}")
+        return None
 
 
 def _freeze_camera_settings(cap):
@@ -191,6 +205,9 @@ class ObjectDetectionYOLO(threading.Thread):
         self.processor = processor
         self._stop_evt = threading.Event()
         self._frame_count = 0
+        self._last_detection_time = time.time()  # Track last time a target was detected
+        self._audio_playing = True  # Track if audio is currently active
+        self._last_audio_stop_time = None  # Track when audio was last stopped to avoid spam
 
     def stop(self):
         """Stop the vision thread."""
@@ -235,7 +252,19 @@ class ObjectDetectionYOLO(threading.Thread):
     def run(self):
         """Main vision thread loop."""
         # Lazy imports so offline render can still run without these packages.
-        import cv2
+        try:
+            import cv2
+        except ImportError as e:
+            print(f"[VISION][ERR] Failed to import cv2: {e}")
+            return
+        
+        # Check if cv2 has GUI support (imshow)
+        if not hasattr(cv2, 'imshow'):
+            print("[VISION][ERR] cv2 does not have GUI support (imshow).")
+            print("           You may have cv2-headless installed instead of cv2.")
+            print("           Install cv2 with: pip install opencv-python")
+            return
+        
         from ultralytics import YOLO
 
         print("[VISION] Starting YOLO Phase-3 thread...")
@@ -252,7 +281,7 @@ class ObjectDetectionYOLO(threading.Thread):
         names = model.names
 
         cap = _open_camera_for_vision()
-        if not cap.isOpened():
+        if cap is None or not cap.isOpened():
             print("[VISION][ERR] Could not open camera.")
             return
 
@@ -296,48 +325,92 @@ class ObjectDetectionYOLO(threading.Thread):
                     cv2.imshow(VISION_CONFIG["window_name"], res.plot())
                     if (cv2.waitKey(1) & 0xFF) == ord("q"):
                         self.stop()
-                continue
+                # NOTE: Do NOT continue here - we need to process no-detection timeout below
+                target_detected = False
+            else:
+                # Process each tracked detection
+                target_detected = False
+                for detection in res.boxes:
+                    cls_id = int(detection.cls)
+                    cls_name = names.get(cls_id, str(cls_id))
+                    if cls_name != "person" or detection.id is None:
+                        continue
+                    
+                    target_detected = True  # A target object was detected
+                    person_id = int(detection.id)
+                    
+                    # Only proceed with audio updates if processor is available
+                    if self.processor is None:
+                        continue
+                    
+                    source_id = person_id - 1  # ID 1 -> source 0, ID 2 -> source 1, etc.
+                    if source_id >= len(self.processor.sources):
+                        continue
 
-            # Process each tracked detection
-            for detection in res.boxes:
-                cls_id = int(detection.cls)
-                cls_name = names.get(cls_id, str(cls_id))
-                if cls_name != "person" or detection.id is None:
-                    continue
-                person_id = int(detection.id)
+                    x1, y1, x2, y2 = detection.xyxy[0].cpu().numpy()
+                    cx = 0.5 * (x1 + x2)
+                    cy = 0.5 * (y1 + y2)
+                    H, W = frame.shape[:2]
+
+                    az_deg = _pixels_to_azimuth_deg(cx, W, VISION_CONFIG["hfov_deg"])
+                    vfov_deg = self._compute_vfov_deg(VISION_CONFIG["hfov_deg"], W, H)
+                    ny = (cy - (H / 2.0)) / (H / 2.0)
+                    el_deg = -ny * (vfov_deg / 2.0)
+
+                    roll, pitch, yaw = self.processor.imu.get_euler()
+                    conf = float(detection.conf.cpu().numpy().item())
+                    dist_m = self._estimate_distance_m(x1, y1, x2, y2, cls_name, W, H)
+                    # ✓ FIXED: Use unified system clock
+                    t_vision = system_clock.now()
+
+                    self.processor.update_vision_target(
+                        az_deg, el_deg, yaw_deg=yaw, pitch_deg=pitch,
+                        distance_m=dist_m, conf=conf, cls_name=cls_name,
+                        t_vision=t_vision, source_id=source_id
+                    )
+
+                    # Throttle prints
+                    if self._frame_count % print_every == 0:
+                        print(f"[VISION] personID={person_id} source={source_id} conf={conf:.2f} az_deg={az_deg:.1f} el_deg={el_deg:.1f} dist_m={dist_m:.2f}")
                 
-                # Only proceed with audio updates if processor is available
-                if self.processor is None:
-                    continue
+                if VISION_CONFIG["show_window"]:
+                    annotated_frame = res.plot()
+                    cv2.imshow(VISION_CONFIG["window_name"], annotated_frame)
+                    if (cv2.waitKey(1) & 0xFF) == ord("q"):
+                        self.stop()
+            
+            # Handle no-detection timeout - stop audio if no target detected
+            if target_detected:
+                self._last_detection_time = time.time()
+                self._last_audio_stop_time = None  # Reset stop time tracking
+                # Resume audio if it was stopped
+                if not self._audio_playing and self.processor is not None:
+                    try:
+                        self.processor.start_playback()
+                        self._audio_playing = True
+                        print("[VISION] Target detected - resuming audio playback.")
+                    except Exception as e:
+                        print(f"[VISION] Could not resume playback: {e}")
+            else:
+                # Check if target detection timeout has expired
+                no_detection_timeout = float(VISION_CONFIG.get("no_detection_fade_s", 0.75))
+                time_since_last_detection = time.time() - self._last_detection_time
                 
-                source_id = person_id - 1  # ID 1 -> source 0, ID 2 -> source 1, etc.
-                if source_id >= len(self.processor.sources):
-                    continue
-
-                x1, y1, x2, y2 = detection.xyxy[0].cpu().numpy()
-                cx = 0.5 * (x1 + x2)
-                cy = 0.5 * (y1 + y2)
-                H, W = frame.shape[:2]
-
-                az_deg = _pixels_to_azimuth_deg(cx, W, VISION_CONFIG["hfov_deg"])
-                vfov_deg = self._compute_vfov_deg(VISION_CONFIG["hfov_deg"], W, H)
-                ny = (cy - (H / 2.0)) / (H / 2.0)
-                el_deg = -ny * (vfov_deg / 2.0)
-
-                roll, pitch, yaw = self.processor.imu.get_euler()
-                conf = float(detection.conf.cpu().numpy().item())
-                dist_m = self._estimate_distance_m(x1, y1, x2, y2, cls_name, W, H)
-                t_vision = time.time()
-
-                self.processor.update_vision_target(
-                    az_deg, el_deg, yaw_deg=yaw, pitch_deg=pitch,
-                    distance_m=dist_m, conf=conf, cls_name=cls_name,
-                    t_vision=t_vision, source_id=source_id
-                )
-
-                # Throttle prints
-                if self._frame_count % print_every == 0:
-                    print(f"[VISION] personID={person_id} source={source_id} conf={conf:.2f} az_deg={az_deg:.1f} el_deg={el_deg:.1f} dist_m={dist_m:.2f}")
+                # Only stop audio once when timeout is exceeded
+                if time_since_last_detection > no_detection_timeout and self._audio_playing and self.processor is not None:
+                    # Avoid repeated stop calls
+                    if self._last_audio_stop_time is None or (time.time() - self._last_audio_stop_time) > 1.0:
+                        try:
+                            self.processor.stop_playback()
+                            self._audio_playing = False
+                            self._last_audio_stop_time = time.time()
+                            print(f"[VISION] No target detected for {time_since_last_detection:.2f}s (threshold: {no_detection_timeout}s) - stopping audio playback.")
+                        except Exception as e:
+                            print(f"[VISION] Could not stop playback: {e}")
+                
+                # Throttle debug prints for no detection
+                if self._frame_count % (print_every * 2) == 0:
+                    print(f"[VISION] No target detected - time since last: {time_since_last_detection:.2f}s (threshold: {no_detection_timeout}s)")
 
             if VISION_CONFIG["show_window"]:
                 annotated_frame = res.plot()

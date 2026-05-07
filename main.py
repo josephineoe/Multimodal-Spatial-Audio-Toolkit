@@ -6,29 +6,74 @@
 import threading
 import time
 import os
+import argparse
+import sys
 
 # Import modules
 from hrtf import SpatialAudioProcessor
 from vision import ObjectDetectionYOLO, VISION_CONFIG, start_and_test_vision
 
 
-# Enable HRTF/audio processing by default unless overridden externally.
-ENABLE_HRTF = True
+def parse_arguments():
+    """Parse command-line arguments for subsystem selection."""
+    parser = argparse.ArgumentParser(
+        description="Multimodal Spatial Audio Toolkit - HRTF + Vision + Head-Tracking",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python main.py                        # Run both audio (HRTF) and vision
+  python main.py --audio-only           # Run audio (HRTF) only, skip vision
+  python main.py --vision-only          # Run vision only, skip audio (HRTF)
+  python main.py --mode 2               # Offline render (no vision)
+        """
+    )
+    
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        "--audio-only",
+        action="store_true",
+        help="Run audio (HRTF) processing only, no vision"
+    )
+    group.add_argument(
+        "--vision-only",
+        action="store_true",
+        help="Run vision only, no audio (HRTF) processing"
+    )
+    
+    parser.add_argument(
+        "--mode",
+        type=str,
+        choices=["1", "2"],
+        default="1",
+        help="Operation mode: 1=real-time (default), 2=offline render"
+    )
+    
+    return parser.parse_args()
 
 
 def main():
     """Main entry point: Setup and orchestration."""
+    args = parse_arguments()
+    
+    # Determine which subsystems to enable
+    enable_audio = not args.vision_only
+    enable_vision = not args.audio_only
+    
     print("=" * 70)
     print("MULTIMODAL SPATIAL AUDIO TOOLKIT")
     print("HRTF + Vision + Head-Tracking")
     print("=" * 70)
+    print()
+    print(f"Subsystems: {'Audio' if enable_audio else ''}"
+          f"{' + ' if enable_audio and enable_vision else ''}"
+          f"{'Vision' if enable_vision else ''}")
+    print()
 
     try:
-        audio_files = ["rain.wav", "drums.wav"]
+        audio_files = ["drums.wav", "rain.wav"]
 
         processor = None
-        if ENABLE_HRTF:
-            from hrtf import SpatialAudioProcessor
+        if enable_audio:
             processor = SpatialAudioProcessor(
                 audio_files=audio_files,
                 sofa_file="MIT_KEMAR_normal_pinna.sofa",
@@ -37,17 +82,15 @@ def main():
                 vision_config=VISION_CONFIG
             )
         else:
-            print("[MAIN] HRTF/audio processing is DISABLED.")
+            print("[MAIN] Audio (HRTF) processing is DISABLED.")
 
         # Ask user for mode
-        mode = input(
-            "Choose mode:\n"
-            "  1. Real-time playback (head-tracked + vision)\n"
-            "  2. Offline render to WAV (no vision)\n"
-            "Choice (1/2): "
-        ).strip()
-
-        if mode == "2" and ENABLE_HRTF:
+        if args.mode == "2":
+            if not enable_audio:
+                print("[MAIN] Offline render requires audio (HRTF) to be enabled.")
+                print("[MAIN] Use: python main.py --mode 2")
+                return
+            
             duration = input("Offline render duration in seconds (default 5): ").strip()
             try:
                 duration = float(duration)
@@ -56,12 +99,18 @@ def main():
             processor.export_offline_render(duration_seconds=duration)
 
         else:
-            # Only start playback if HRTF is enabled
-            if ENABLE_HRTF:
+            # Real-time playback mode
+            if enable_audio:
                 processor.start_playback()
+            else:
+                print("[MAIN] Real-time playback (audio disabled - vision only).")
 
-            # Start vision thread (can pass None if processor is not needed)
-            vision_thread = start_and_test_vision(processor)
+            # Start vision thread (if enabled)
+            vision_thread = None
+            if enable_vision:
+                vision_thread = start_and_test_vision(processor)
+            else:
+                print("[MAIN] Vision processing is DISABLED.")
 
             # Simple interactive controls
             control_state = {"vision": vision_thread}
@@ -78,11 +127,14 @@ def main():
                         return
 
                     if cmd == "r":
-                        if ENABLE_HRTF:
+                        if enable_audio and processor is not None:
                             processor.toggle_recording()
                         else:
-                            print("[CTRL] Recording unavailable (HRTF disabled).")
+                            print("[CTRL] Recording unavailable (audio disabled).")
                     elif cmd == "d":
+                        if not enable_vision:
+                            print("[CTRL] Debug display unavailable (vision disabled).")
+                            continue
                         VISION_CONFIG["show_window"] = not VISION_CONFIG["show_window"]
                         state = "ON" if VISION_CONFIG["show_window"] else "OFF"
                         print(f"[CTRL] 📷 Webcam POV debug display: {state}")
@@ -91,6 +143,9 @@ def main():
                         else:
                             print(f"      Closing camera feed window.")
                     elif cmd == "v":
+                        if not enable_vision:
+                            print("[CTRL] Vision is disabled (use without --vision-only to enable).")
+                            continue
                         vt = control_state.get("vision")
                         if vt is None or not vt.is_alive():
                             try:
@@ -133,7 +188,7 @@ def main():
                     pass
 
                 try:
-                    if ENABLE_HRTF:
+                    if enable_audio and processor is not None:
                         processor.stop_playback()
                 except Exception:
                     pass

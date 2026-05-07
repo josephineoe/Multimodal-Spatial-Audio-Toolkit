@@ -3,7 +3,6 @@
 # Head-tracked HRTF spatial audio with IMU support
 # ============================================================================
 
-import socket
 import threading
 import time
 import csv
@@ -14,6 +13,12 @@ import soundfile as sf
 import sounddevice as sd
 from scipy import signal
 from dataclasses import dataclass
+
+# Import IMU module
+from imu import HeadTrackingReceiver, YAW_SIGN
+
+# Import timing module for unified clock
+from timing import system_clock
 
 
 # =========================================================
@@ -72,27 +77,41 @@ class DebugLogger:
             self._imu_fp = None
             self._imu_w = None
 
-    def log_vision(self, t, az_deg, el_deg, dist_m, conf, cls_name, t_vision):
-        """Log vision data with latency calculation."""
+    def log_vision(self, t_received, az_deg, el_deg, dist_m, conf, cls_name, t_vision):
+        """
+        Log vision data with proper latency calculation.
+        
+        Args:
+            t_received: When this log entry was created (from system_clock.now())
+            t_vision: When vision detector ran (from system_clock.now() at source)
+        """
         with self._lock:
             if not self._enabled or self._vision_w is None:
                 return
             try:
-                latency_ms = (time.time() - float(t_vision)) * 1000.0
-                self._vision_w.writerow([float(t), float(az_deg), float(el_deg), float(dist_m),
+                # ✓ FIXED: Both timestamps use same clock source (system_clock)
+                latency_ms = (float(t_received) - float(t_vision)) * 1000.0
+                self._vision_w.writerow([float(t_received), float(az_deg), float(el_deg), float(dist_m),
                                          float(conf) if conf is not None else 0.0, str(cls_name) if cls_name else "", float(latency_ms)])
                 self._vision_fp.flush()
             except Exception:
                 pass
 
-    def log_imu(self, t, qw, qx, qy, qz, roll, pitch, yaw, t_send):
-        """Log IMU data with latency calculation."""
+    def log_imu(self, t_received, qw, qx, qy, qz, roll, pitch, yaw, t_send):
+        """
+        Log IMU data with proper latency calculation.
+        
+        Args:
+            t_received: When this log entry was created (from system_clock.now())
+            t_send: When IMU packet was sent (timestamp from IMU device)
+        """
         with self._lock:
             if not self._enabled or self._imu_w is None:
                 return
             try:
-                latency_ms = (time.time() - float(t_send)) * 1000.0
-                self._imu_w.writerow([float(t), float(qw), float(qx), float(qy), float(qz),
+                # ✓ FIXED: Both timestamps use same clock source (system_clock)
+                latency_ms = (float(t_received) - float(t_send)) * 1000.0
+                self._imu_w.writerow([float(t_received), float(qw), float(qx), float(qy), float(qz),
                                       float(roll), float(pitch), float(yaw), float(latency_ms)])
                 self._imu_fp.flush()
             except Exception:
@@ -128,115 +147,6 @@ class SourceState:
     last_update_t: float = 0.0
     conf: float = 0.0
     cls_name: str = ""
-
-
-# =========================================================
-# IMU Sign Convention
-# =========================================================
-YAW_SIGN = -1
-
-# =========================================================
-# HeadTrackingReceiver: IMU / Quaternion receiver
-# =========================================================
-
-class HeadTrackingReceiver:
-    """
-    Background UDP listener that receives head orientation quaternions and converts to Euler angles.
-    Enables head-tracked audio by providing real-time roll, pitch, yaw orientation data.
-    """
-
-    def __init__(self, ip="0.0.0.0", port=5005, logger=None):
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.bind((ip, port))
-        self.sock.setblocking(False)
-
-        # Shared quaternion state
-        self.qw = 1.0
-        self.qx = 0.0
-        self.qy = 0.0
-        self.qz = 0.0
-
-        self.t_send = 0.0
-        self.logger = logger
-        thread = threading.Thread(target=self._loop, daemon=True)
-        thread.start()
-
-        print(f"[IMU] Listening for quaternions on {ip}:{port}")
-
-    def _loop(self):
-        """Background UDP receive loop."""
-        # Accept BOTH formats:
-        #  1) CSV:          t_send,qw,qx,qy,qz
-        #  2) Labeled text: qw: 0.919 qx: 0.057 qy: 0.275 qz: 0.275
-        while True:
-            try:
-                data, _ = self.sock.recvfrom(1024)
-                s = data.decode(errors="ignore").strip()
-                if not s:
-                    continue
-
-                # Format 1: CSV (preferred for latency logging)
-                if "," in s:
-                    parts = [p.strip() for p in s.split(",")]
-                    if len(parts) >= 5:
-                        t_send, qw, qx, qy, qz = map(float, parts[:5])
-                    else:
-                        # Unexpected CSV shape
-                        continue
-                else:
-                    # Format 2: labeled text
-                    # Example: "qw: 0.919 qx: 0.057 qy: 0.275 qz: 0.275"
-                    tokens = s.replace(":", "").split()
-                    if len(tokens) < 8:
-                        continue
-                    kv = dict(zip(tokens[0::2], tokens[1::2]))
-                    qw = float(kv.get("qw"))
-                    qx = float(kv.get("qx"))
-                    qy = float(kv.get("qy"))
-                    qz = float(kv.get("qz"))
-                    # Sender did not provide a timestamp in this format
-                    t_send = time.time()
-
-                self.t_send = float(t_send)
-                self.qw, self.qx, self.qy, self.qz = float(qw), float(qx), float(qy), float(qz)
-
-                if self.logger:
-                    roll, pitch, yaw = self.get_euler()
-                    self.logger.log_imu(time.time(), qw, qx, qy, qz, roll, pitch, yaw, t_send)
-
-            except Exception:
-                # Ignore malformed/empty packets
-                pass
-
-    def get_euler(self):
-        """
-        Convert internal quaternion to roll, pitch, yaw (degrees).
-        Uses standard aerospace convention (Z-Y-X).
-        """
-        w, x, y, z = self.qw, self.qx, self.qy, self.qz
-
-        # Normalize quaternion
-        n = np.sqrt(w * w + x * x + y * y + z * z)
-        if n == 0.0:
-            return 0.0, 0.0, 0.0
-        w, x, y, z = w / n, x / n, y / n, z / n
-
-        # roll (x-axis rotation)
-        sinr = 2.0 * (w * x + y * z)
-        cosr = 1.0 - 2.0 * (x * x + y * y)
-        roll = np.degrees(np.arctan2(sinr, cosr))
-
-        # pitch (y-axis rotation)
-        sinp = 2.0 * (w * y - z * x)
-        sinp_clamped = np.clip(sinp, -1.0, 1.0)
-        pitch = np.degrees(np.arcsin(sinp_clamped))
-
-        # yaw (z-axis rotation)
-        siny = 2.0 * (w * z + x * y)
-        cosy = 1.0 - 2.0 * (y * y + z * z)
-        yaw = np.degrees(np.arctan2(siny, cosy))
-
-        return float(roll), float(pitch), float(yaw)
 
 
 # =========================================================
@@ -495,7 +405,9 @@ class SpatialAudioProcessor:
 
         # Log vision data
         try:
-            self.logger.log_vision(t, azimuth_deg, elevation_deg, d, c, cname, t)
+            # ✓ FIXED: Separate timestamps for receiver and source
+            t_received = system_clock.now()  # When we logged this
+            self.logger.log_vision(t_received, azimuth_deg, elevation_deg, d, c, cname, t_vision)
         except Exception:
             pass
 
