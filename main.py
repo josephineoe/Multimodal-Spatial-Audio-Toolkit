@@ -20,11 +20,14 @@ def parse_arguments():
         description="Multimodal Spatial Audio Toolkit - HRTF + Vision + Head-Tracking",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Examples:
-  python main.py                        # Run both audio (HRTF) and vision
-  python main.py --audio-only           # Run audio (HRTF) only, skip vision
-  python main.py --vision-only          # Run vision only, skip audio (HRTF)
-  python main.py --mode 2               # Offline render (no vision)
+TEST MODES - Each tests how components control the audio engine:
+
+  python main.py                   Run full system: audio + vision + IMU head-tracking
+  python main.py --audio-only      Test audio with IMU head-tracking (no vision)
+  python main.py --vision-only     Test audio with vision control (mock IMU, no head-tracking)
+  python main.py --mode 2          Offline audio render (HRTF without real-time I/O)
+
+Each mode lets you HEAR how that component controls the spatial audio.
         """
     )
     
@@ -32,12 +35,12 @@ Examples:
     group.add_argument(
         "--audio-only",
         action="store_true",
-        help="Run audio (HRTF) processing only, no vision"
+        help="Test audio engine with IMU head-tracking only (no vision)"
     )
     group.add_argument(
         "--vision-only",
         action="store_true",
-        help="Run vision only, no audio (HRTF) processing"
+        help="Test audio engine with vision control only (uses mock IMU, no head-tracking)"
     )
     
     parser.add_argument(
@@ -56,7 +59,10 @@ def main():
     args = parse_arguments()
     
     # Determine which subsystems to enable
-    enable_audio = not args.vision_only
+    # Audio engine always runs - it's the core component
+    # --audio-only: Audio + IMU (no vision)
+    # --vision-only: Audio + Vision (IMU waits for signal, times out gracefully)
+    # Default: Audio + IMU + Vision
     enable_vision = not args.audio_only
     
     print("=" * 70)
@@ -64,33 +70,37 @@ def main():
     print("HRTF + Vision + Head-Tracking")
     print("=" * 70)
     print()
-    print(f"Subsystems: {'Audio' if enable_audio else ''}"
-          f"{' + ' if enable_audio and enable_vision else ''}"
-          f"{'Vision' if enable_vision else ''}")
+    subsystems = ["Audio Engine (HRTF)"]
+    if enable_vision:
+        subsystems.append("Vision (YOLO)")
+    subsystems.append("IMU Head-Tracking")
+    print(f"Active Subsystems: {' + '.join(subsystems)}")
+    if args.vision_only:
+        print("  Mode: VISION CONTROL TEST")
+        print("  (Audio spatialized by vision, IMU waiting for data)")
+    elif args.audio_only:
+        print("  Mode: IMU CONTROL TEST")
+        print("  (Audio spatialized by head movement, no vision)")
+    else:
+        print("  Mode: FULL SYSTEM")
+        print("  (Audio spatialized by both vision and head movement)")
     print()
 
     try:
         audio_files = ["drums.wav", "rain.wav"]
 
-        processor = None
-        if enable_audio:
-            processor = SpatialAudioProcessor(
-                audio_files=audio_files,
-                sofa_file="MIT_KEMAR_normal_pinna.sofa",
-                sample_rate=44100,
-                imu_port=5005,
-                vision_config=VISION_CONFIG
-            )
-        else:
-            print("[MAIN] Audio (HRTF) processing is DISABLED.")
+        # Initialize audio engine (HRTF + IMU + Vision)
+        processor = SpatialAudioProcessor(
+            audio_files=audio_files,
+            sofa_file="MIT_KEMAR_normal_pinna.sofa",
+            sample_rate=44100,
+            imu_port=5005,
+            vision_config=VISION_CONFIG
+        )
 
         # Ask user for mode
         if args.mode == "2":
-            if not enable_audio:
-                print("[MAIN] Offline render requires audio (HRTF) to be enabled.")
-                print("[MAIN] Use: python main.py --mode 2")
-                return
-            
+            print("\n[MAIN] Offline render mode selected.")
             duration = input("Offline render duration in seconds (default 5): ").strip()
             try:
                 duration = float(duration)
@@ -100,17 +110,16 @@ def main():
 
         else:
             # Real-time playback mode
-            if enable_audio:
-                processor.start_playback()
-            else:
-                print("[MAIN] Real-time playback (audio disabled - vision only).")
+            print("\n[MAIN] Starting real-time audio playback...")
+            processor.start_playback()
 
             # Start vision thread (if enabled)
             vision_thread = None
             if enable_vision:
+                print("[MAIN] Starting vision (YOLO)...")
                 vision_thread = start_and_test_vision(processor)
             else:
-                print("[MAIN] Vision processing is DISABLED.")
+                print("[MAIN] Vision is DISABLED (audio only mode).")
 
             # Simple interactive controls
             control_state = {"vision": vision_thread}
@@ -127,10 +136,10 @@ def main():
                         return
 
                     if cmd == "r":
-                        if enable_audio and processor is not None:
+                        if processor is not None:
                             processor.toggle_recording()
                         else:
-                            print("[CTRL] Recording unavailable (audio disabled).")
+                            print("[CTRL] Recording unavailable.")
                     elif cmd == "d":
                         if not enable_vision:
                             print("[CTRL] Debug display unavailable (vision disabled).")
@@ -188,7 +197,7 @@ def main():
                     pass
 
                 try:
-                    if enable_audio and processor is not None:
+                    if processor is not None:
                         processor.stop_playback()
                 except Exception:
                     pass

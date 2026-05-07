@@ -366,6 +366,18 @@ class SpatialAudioProcessor:
 
     # ---- Vision API ----
 
+    def deactivate_source(self, source_id: int):
+        """
+        Explicitly deactivate a source (e.g., when person is no longer tracked).
+        Sources deactivate automatically when detection timeout expires, but this
+        provides explicit control if needed.
+        """
+        if source_id < len(self.sources):
+            self.sources[source_id].is_active = False
+        with self._source_states_lock:
+            if source_id < len(self.source_states):
+                self.source_states[source_id].active = False
+
     def update_vision_target(self, azimuth_deg, elevation_deg, yaw_deg, pitch_deg, distance_m=None, conf=None, cls_name=None, t_vision=None, source_id=0):
         """
         Provide a camera/head-relative vision target with timing alignment.
@@ -669,6 +681,10 @@ class SpatialAudioProcessor:
                 dist_for_audio = None
                 gain_for_audio = 1.0  # Always full gain for head-tracked audio
 
+            # ✓ FIXED: Set is_active based on whether detection is fresh
+            # Only play audio for sources with active detections within timeout
+            self.sources[i].is_active = fresh
+            
             self.sources[i].set_target_position(azimuth=az_for_audio, elevation=el_for_audio, distance=dist_for_audio)
             self.sources[i].set_target_gain(gain_for_audio)
 
