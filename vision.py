@@ -34,13 +34,20 @@ VISION_CONFIG = {
     "conf_thres": 0.25,
     "infer_hz": 8.0,
 
+    # Detection mode (configurable via runtime key presses)
+    # Mode 1: Both animate + inanimate objects
+    # Mode 2: Inanimate objects only (bed, chair, couch, etc.)
+    # Mode 3: Animate objects only (person) - RECOMMENDED FOR TESTING (IMU not ready)
+    "detection_mode": 3,  # Start with person-only for testing
+
+    # Class categories for multi-layer detection
+    "animate_classes": {"person"},
+    "inanimate_classes": {"cup", "chair", "couch", "bed", "dining table", "book", "microwave"},
+
     # Target selection mode for vision:
     #  - "allowed_objects": largest box among allowed_classes (includes person)
     #  - "person_only":     largest person box only
     "target_mode": "allowed_objects",
-
-    # Allow-list (includes "person")
-    "allowed_classes": {"cup", "chair", "couch", "bed", "dining table", "book", "microwave", "person"},
 
     # Phase 2 camera model (azimuth-only)
     "hfov_deg": 70.0,
@@ -205,9 +212,15 @@ class ObjectDetectionYOLO(threading.Thread):
         self.processor = processor
         self._stop_evt = threading.Event()
         self._frame_count = 0
-        self._last_detection_time = time.time()  # Track last time a target was detected
+        # ✓ FIXED: Use unified system clock for consistent timing
+        self._last_detection_time = system_clock.now()  # Track last time a target was detected
         self._audio_playing = True  # Track if audio is currently active
         self._last_audio_stop_time = None  # Track when audio was last stopped to avoid spam
+        # Object ID to source index mapping
+        self._id_to_source = {}  # dict: {tracking_id -> source_idx}
+        self._next_source_idx = 0  # Next available source index
+        self._id_timeout_s = 1.0  # Remove mapping if object not seen for this long
+        self._id_last_seen = {}  # dict: {tracking_id -> last_seen_time}
 
     def stop(self):
         """Stop the vision thread."""
@@ -220,11 +233,15 @@ class ObjectDetectionYOLO(threading.Thread):
         return math.degrees(vf)
 
     def _estimate_distance_m(self, x1: float, y1: float, x2: float, y2: float, cls_name: str, frame_w: int, frame_h: int) -> float:
-        """Estimate distance using bbox height + assumed real-world height (no depth AI)."""
+        """
+        Estimate distance using bbox height (not width!) and assumed real-world height.
+        This function always uses the vertical size of the bounding box for distance estimation.
+        """
         mode = VISION_CONFIG.get("distance_mode", "fixed")
         if mode == "fixed":
             return float(VISION_CONFIG.get("distance_fixed_m", 1.4))
 
+        # Always use height (y2 - y1) for distance estimation
         bbox_h = max(1.0, float(y2) - float(y1))
 
         sizes = VISION_CONFIG.get("class_real_heights_m", {}) or {}
@@ -233,7 +250,7 @@ class ObjectDetectionYOLO(threading.Thread):
         hfov = float(VISION_CONFIG.get("hfov_deg", 70.0))
         vfov = self._compute_vfov_deg(hfov, frame_w, frame_h)
 
-        # focal length in pixels (vertical)
+        # Focal length in pixels (vertical)
         f = (frame_h / 2.0) / max(1e-6, math.tan(math.radians(vfov) / 2.0))
 
         dist = (real_h * f) / bbox_h
@@ -242,7 +259,7 @@ class ObjectDetectionYOLO(threading.Thread):
         dmax = float(VISION_CONFIG.get("distance_max_m", 6.0))
         dist = float(max(dmin, min(dmax, dist)))
 
-        # smooth (EMA)
+        # Smooth (EMA)
         if not hasattr(self, "_dist_ema"):
             self._dist_ema = dist
         alpha = float(VISION_CONFIG.get("distance_smoothing_alpha", 0.25))
@@ -287,8 +304,9 @@ class ObjectDetectionYOLO(threading.Thread):
 
         _freeze_camera_settings(cap)
 
+        # ✓ FIXED: Use unified system clock for consistent frame timing
         infer_interval = 1.0 / float(VISION_CONFIG["infer_hz"])
-        next_t = time.time()
+        next_t = system_clock.now()
         print_every = VISION_CONFIG.get("print_every_n_frames", 30)
 
         while not self._stop_evt.is_set():
@@ -297,12 +315,10 @@ class ObjectDetectionYOLO(threading.Thread):
                 time.sleep(0.01)
                 continue
 
-            now = time.time()
+            # ✓ FIXED: Use unified system clock instead of wall-clock time
+            now = system_clock.now()
             if now < next_t:
-                if VISION_CONFIG["show_window"]:
-                    cv2.imshow(VISION_CONFIG["window_name"], frame)
-                    if (cv2.waitKey(1) & 0xFF) == ord("q"):
-                        self.stop()
+                # Skip to next inference time, don't display yet
                 continue
 
             next_t = now + infer_interval
@@ -311,99 +327,118 @@ class ObjectDetectionYOLO(threading.Thread):
             # YOLO inference with tracking
             results = model.track(frame, conf=VISION_CONFIG["conf_thres"], persist=True, verbose=False)
             
-            if results is None or len(results) == 0:
-                if VISION_CONFIG["show_window"]:
-                    cv2.imshow(VISION_CONFIG["window_name"], frame)
-                    if (cv2.waitKey(1) & 0xFF) == ord("q"):
-                        self.stop()
-                continue
+            # Track detection state for entire frame
+            target_detected = False
             
-            res = results[0]
-            
-            if res.boxes is None or len(res.boxes) == 0:
-                if VISION_CONFIG["show_window"]:
-                    cv2.imshow(VISION_CONFIG["window_name"], res.plot())
-                    if (cv2.waitKey(1) & 0xFF) == ord("q"):
-                        self.stop()
-                # NOTE: Do NOT continue here - we need to process no-detection timeout below
-                target_detected = False
-            else:
-                # Process each tracked detection
-                target_detected = False
-                for detection in res.boxes:
-                    cls_id = int(detection.cls)
-                    cls_name = names.get(cls_id, str(cls_id))
-                    if cls_name != "person" or detection.id is None:
-                        continue
-                    
-                    target_detected = True  # A target object was detected
-                    person_id = int(detection.id)
-                    
-                    # Only proceed with audio updates if processor is available
-                    if self.processor is None:
-                        continue
-                    
-                    source_id = person_id - 1  # ID 1 -> source 0, ID 2 -> source 1, etc.
-                    if source_id >= len(self.processor.sources):
-                        continue
-
-                    x1, y1, x2, y2 = detection.xyxy[0].cpu().numpy()
-                    cx = 0.5 * (x1 + x2)
-                    cy = 0.5 * (y1 + y2)
-                    H, W = frame.shape[:2]
-
-                    az_deg = _pixels_to_azimuth_deg(cx, W, VISION_CONFIG["hfov_deg"])
-                    vfov_deg = self._compute_vfov_deg(VISION_CONFIG["hfov_deg"], W, H)
-                    ny = (cy - (H / 2.0)) / (H / 2.0)
-                    el_deg = -ny * (vfov_deg / 2.0)
-
-                    roll, pitch, yaw = self.processor.imu.get_euler()
-                    conf = float(detection.conf.cpu().numpy().item())
-                    dist_m = self._estimate_distance_m(x1, y1, x2, y2, cls_name, W, H)
-                    # ✓ FIXED: Use unified system clock
-                    t_vision = system_clock.now()
-
-                    self.processor.update_vision_target(
-                        az_deg, el_deg, yaw_deg=yaw, pitch_deg=pitch,
-                        distance_m=dist_m, conf=conf, cls_name=cls_name,
-                        t_vision=t_vision, source_id=source_id
-                    )
-
-                    # Throttle prints
-                    if self._frame_count % print_every == 0:
-                        print(f"[VISION] personID={person_id} source={source_id} conf={conf:.2f} az_deg={az_deg:.1f} el_deg={el_deg:.1f} dist_m={dist_m:.2f}")
+            # Always process results if available
+            if results is not None and len(results) > 0:
+                res = results[0]
                 
-                if VISION_CONFIG["show_window"]:
-                    annotated_frame = res.plot()
-                    cv2.imshow(VISION_CONFIG["window_name"], annotated_frame)
-                    if (cv2.waitKey(1) & 0xFF) == ord("q"):
-                        self.stop()
+                if res.boxes is not None and len(res.boxes) > 0:
+                    # ✓ FIXED: Process each tracked detection respecting detection_mode
+                    # Mode 1: Both animate + inanimate
+                    # Mode 2: Inanimate only
+                    # Mode 3: Animate (person) only
+                    
+                    # Clean up stale object ID mappings (objects not seen recently)
+                    current_time = system_clock.now()
+                    stale_ids = [obj_id for obj_id, last_seen in self._id_last_seen.items()
+                                 if (current_time - last_seen) > self._id_timeout_s]
+                    for stale_id in stale_ids:
+                        if stale_id in self._id_to_source:
+                            source_idx = self._id_to_source[stale_id]
+                            del self._id_to_source[stale_id]
+                            del self._id_last_seen[stale_id]
+                            print(f"[VISION] Deactivating source {source_idx} (object ID {stale_id} timeout)")
+                    
+                    for detection in res.boxes:
+                        cls_id = int(detection.cls)
+                        cls_name = names.get(cls_id, str(cls_id))
+                        detection_mode = VISION_CONFIG.get("detection_mode", 3)
+                        # Strict mode 3: only allow 'person' (case-insensitive)
+                        if detection_mode == 3:
+                            if cls_name.lower() != "person" or detection.id is None:
+                                continue
+                        elif detection_mode == 2:
+                            inanimate_cls = {c.lower() for c in VISION_CONFIG.get("inanimate_classes", {})}
+                            if cls_name.lower() not in inanimate_cls or detection.id is None:
+                                continue
+                        else:  # mode 1: both
+                            animate_cls = {c.lower() for c in VISION_CONFIG.get("animate_classes", {"person"})}
+                            inanimate_cls = {c.lower() for c in VISION_CONFIG.get("inanimate_classes", {})}
+                            if cls_name.lower() not in (animate_cls | inanimate_cls) or detection.id is None:
+                                continue
+                        target_detected = True  # A target object was detected
+                        
+                        # Object ID to source mapping
+                        obj_id = int(detection.id)
+                        self._id_last_seen[obj_id] = current_time  # Mark as recently seen
+                        
+                        # Assign or reuse source index for this object ID
+                        if obj_id not in self._id_to_source:
+                            # New object: assign next available source
+                            source_idx = self._next_source_idx % (len(self.processor.sources) or 1)
+                            self._id_to_source[obj_id] = source_idx
+                            self._next_source_idx = (self._next_source_idx + 1) % (len(self.processor.sources) or 1)
+                            print(f"[VISION] Assigning object ID {obj_id} ({cls_name}) to source {source_idx}")
+                        else:
+                            source_idx = self._id_to_source[obj_id]
+                        
+                        person_id = obj_id  # Use object tracking ID
+                        
+                        # Get bounding box for this detection
+                        x1, y1, x2, y2 = detection.xyxy[0].cpu().numpy()
+                        cx = 0.5 * (x1 + x2)
+                        H, W = frame.shape[:2]
+                        
+                        # Convert to azimuth and estimate distance
+                        az_deg = _pixels_to_azimuth_deg(cx, W, VISION_CONFIG["hfov_deg"])
+                        el_deg = 0.0  # azimuth-only for now
+                        conf = float(detection.conf)
+                        dist_m = self._estimate_distance_m(x1, y1, x2, y2, cls_name, W, H)
+                        
+                        # Get IMU angles for world-lock (skip if IMU disabled)
+                        if self.processor is not None and getattr(self.processor, 'imu', None) is not None:
+                            try:
+                                roll, pitch, yaw = self.processor.imu.get_euler()
+                            except Exception:
+                                roll, pitch, yaw = 0.0, 0.0, 0.0
+                        else:
+                            roll, pitch, yaw = 0.0, 0.0, 0.0
+                        
+                        # Send update to audio processor
+                        self.processor.update_vision_target(
+                            az_deg, el_deg, yaw, pitch, distance_m=dist_m, conf=conf,
+                            cls_name=cls_name, t_vision=system_clock.now(), source_id=source_idx
+                        )
+                        
+                        print(f"[VISION] obj_id={person_id} source={source_idx} class={cls_name} conf={conf:.2f} az={az_deg:.1f}° dist={dist_m:.2f}m")
             
-            # Handle no-detection timeout - stop audio if no target detected
+            # ✓ FIXED: Handle no-detection timeout (moved outside the branch)
             if target_detected:
-                self._last_detection_time = time.time()
+                self._last_detection_time = system_clock.now()
                 self._last_audio_stop_time = None  # Reset stop time tracking
                 # Resume audio if it was stopped
                 if not self._audio_playing and self.processor is not None:
                     try:
                         self.processor.start_playback()
                         self._audio_playing = True
-                        print("[VISION] Target detected - resuming audio playback.")
+                        print(f"[VISION] {len(self._id_to_source)} active tracked object(s) - resuming audio playback.")
                     except Exception as e:
                         print(f"[VISION] Could not resume playback: {e}")
             else:
                 # Check if target detection timeout has expired
                 no_detection_timeout = float(VISION_CONFIG.get("no_detection_fade_s", 0.75))
-                time_since_last_detection = time.time() - self._last_detection_time
+                time_since_last_detection = system_clock.elapsed_ms(self._last_detection_time) / 1000.0
                 
                 # Only stop audio once when timeout is exceeded
                 if time_since_last_detection > no_detection_timeout and self._audio_playing and self.processor is not None:
                     # Avoid repeated stop calls
-                    if self._last_audio_stop_time is None or (time.time() - self._last_audio_stop_time) > 1.0:
+                    if self._last_audio_stop_time is None or (system_clock.now() - self._last_audio_stop_time) > 1.0:
                         try:
                             self.processor.stop_playback()
                             self._audio_playing = False
-                            self._last_audio_stop_time = time.time()
+                            self._last_audio_stop_time = system_clock.now()
                             print(f"[VISION] No target detected for {time_since_last_detection:.2f}s (threshold: {no_detection_timeout}s) - stopping audio playback.")
                         except Exception as e:
                             print(f"[VISION] Could not stop playback: {e}")
@@ -412,8 +447,12 @@ class ObjectDetectionYOLO(threading.Thread):
                 if self._frame_count % (print_every * 2) == 0:
                     print(f"[VISION] No target detected - time since last: {time_since_last_detection:.2f}s (threshold: {no_detection_timeout}s)")
 
+            # ✓ FIXED: Display window ONCE per frame (moved outside all branches)
             if VISION_CONFIG["show_window"]:
-                annotated_frame = res.plot()
+                if results is not None and len(results) > 0:
+                    annotated_frame = results[0].plot()
+                else:
+                    annotated_frame = frame
                 cv2.imshow(VISION_CONFIG["window_name"], annotated_frame)
                 if (cv2.waitKey(1) & 0xFF) == ord("q"):
                     self.stop()
@@ -434,13 +473,19 @@ def start_and_test_vision(processor):
     print("VISION THREAD - START AND TEST")
     print("=" * 70)
     print()
+    detection_mode = VISION_CONFIG.get("detection_mode", 3)
+    mode_names = {1: "Both (animate+inanimate)", 2: "Inanimate only", 3: "Animate (person) only"}
     print("Vision Configuration:")
+    print(f"  Detection Mode: {detection_mode} - {mode_names.get(detection_mode, 'Unknown')}")
     print(f"  Camera Source: {VISION_CONFIG['camera_source']}")
     print(f"  Resolution: {VISION_CONFIG['width']}x{VISION_CONFIG['height']}")
     print(f"  FPS: {VISION_CONFIG['fps']}")
     print(f"  Model: {VISION_CONFIG['model_path']}")
     print(f"  Confidence Threshold: {VISION_CONFIG['conf_thres']}")
     print(f"  Inference Rate: {VISION_CONFIG['infer_hz']} Hz")
+    print("\n  Detection Classes:")
+    print(f"    Animate: {VISION_CONFIG.get('animate_classes', set())}")
+    print(f"    Inanimate: {VISION_CONFIG.get('inanimate_classes', set())}")
     print()
     
     try:
@@ -513,36 +558,6 @@ if __name__ == "__main__":
     
     print()
     print("Vision module is ready for testing with main.py")
-
-
-def start_and_test_vision(processor):
-    """
-    Start vision thread and test object detection.
-    Independently callable for testing purposes.
-    """
-    print("\n" + "=" * 70)
-    print("VISION THREAD - START AND TEST")
-    print("=" * 70)
-    print()
-    print("Vision Configuration:")
-    print(f"  Camera Source: {VISION_CONFIG['camera_source']}")
-    print(f"  Resolution: {VISION_CONFIG['width']}x{VISION_CONFIG['height']}")
-    print(f"  FPS: {VISION_CONFIG['fps']}")
-    print(f"  Model: {VISION_CONFIG['model_path']}")
-    print(f"  Confidence Threshold: {VISION_CONFIG['conf_thres']}")
-    print(f"  Inference Rate: {VISION_CONFIG['infer_hz']} Hz")
-    print()
-    
-    try:
-        vision_thread = ObjectDetectionYOLO(processor)
-        vision_thread.start()
-        print(f"[VISION] Thread started successfully: {vision_thread.is_alive()}")
-        return vision_thread
-    except Exception as e:
-        print(f"[VISION] Error starting vision thread: {e}")
-        import traceback
-        traceback.print_exc()
-        return None
 
 
 if __name__ == "__main__":

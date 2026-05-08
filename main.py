@@ -20,27 +20,40 @@ def parse_arguments():
         description="Multimodal Spatial Audio Toolkit - HRTF + Vision + Head-Tracking",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-TEST MODES - Each tests how components control the audio engine:
+COMBINATIONS:
 
-  python main.py                   Run full system: audio + vision + IMU head-tracking
-  python main.py --audio-only      Test audio with IMU head-tracking (no vision)
-  python main.py --vision-only     Test audio with vision control (mock IMU, no head-tracking)
-  python main.py --mode 2          Offline audio render (HRTF without real-time I/O)
+  python main.py                                Audio only (no vision, no IMU)
+  python main.py --vision                       Vision-only control
+  python main.py --imu                          IMU head-tracking only
+  python main.py --vision --imu                 Full system (vision + IMU head-tracking)
 
-Each mode lets you HEAR how that component controls the spatial audio.
+DETECTION MODES (for vision-based control):
+
+  --detection-mode 1                Mode 1: Detect BOTH animate (person) + inanimate (furniture)
+  --detection-mode 2                Mode 2: Detect INANIMATE ONLY (bed, chair, couch, etc.)
+  --detection-mode 3 (default)      Mode 3: Detect ANIMATE ONLY (person/movement)
+
+EXAMPLES:
+
+  python main.py --vision --detection-mode 3   Vision control with person detection only
+  python main.py --vision --detection-mode 2   Vision control with furniture detection
+  python main.py --vision --imu                Full system with person + IMU detection
+
+OFFLINE RENDER:
+
+  python main.py --mode 2                       Offline audio render (HRTF without real-time I/O)
         """
     )
     
-    group = parser.add_mutually_exclusive_group()
-    group.add_argument(
-        "--audio-only",
+    parser.add_argument(
+        "--vision",
         action="store_true",
-        help="Test audio engine with IMU head-tracking only (no vision)"
+        help="Enable vision-based object detection for audio control"
     )
-    group.add_argument(
-        "--vision-only",
+    parser.add_argument(
+        "--imu",
         action="store_true",
-        help="Test audio engine with vision control only (uses mock IMU, no head-tracking)"
+        help="Enable IMU head-tracking for audio control"
     )
     
     parser.add_argument(
@@ -49,6 +62,14 @@ Each mode lets you HEAR how that component controls the spatial audio.
         choices=["1", "2"],
         default="1",
         help="Operation mode: 1=real-time (default), 2=offline render"
+    )
+    
+    parser.add_argument(
+        "--detection-mode",
+        type=int,
+        choices=[1, 2, 3],
+        default=3,
+        help="Detection mode: 1=both animate+inanimate, 2=inanimate only, 3=animate/person only (default)"
     )
     
     return parser.parse_args()
@@ -60,10 +81,12 @@ def main():
     
     # Determine which subsystems to enable
     # Audio engine always runs - it's the core component
-    # --audio-only: Audio + IMU (no vision)
-    # --vision-only: Audio + Vision (IMU waits for signal, times out gracefully)
-    # Default: Audio + IMU + Vision
-    enable_vision = not args.audio_only
+    # --vision: Enable vision
+    # --imu: Enable IMU head-tracking
+    # Default (no args): Audio only (vision and IMU disabled)
+    # --vision --imu: Full system
+    enable_vision = args.vision
+    enable_imu = args.imu
     
     print("=" * 70)
     print("MULTIMODAL SPATIAL AUDIO TOOLKIT")
@@ -73,29 +96,39 @@ def main():
     subsystems = ["Audio Engine (HRTF)"]
     if enable_vision:
         subsystems.append("Vision (YOLO)")
-    subsystems.append("IMU Head-Tracking")
+    if enable_imu:
+        subsystems.append("IMU Head-Tracking")
     print(f"Active Subsystems: {' + '.join(subsystems)}")
-    if args.vision_only:
-        print("  Mode: VISION CONTROL TEST")
-        print("  (Audio spatialized by vision, IMU waiting for data)")
-    elif args.audio_only:
-        print("  Mode: IMU CONTROL TEST")
-        print("  (Audio spatialized by head movement, no vision)")
+    
+    if enable_vision and enable_imu:
+        print("  Mode: FULL SYSTEM (vision + IMU head-tracking)")
+    elif enable_vision:
+        print("  Mode: VISION ONLY (no IMU head-tracking)")
+    elif enable_imu:
+        print("  Mode: IMU ONLY (no vision)")
     else:
-        print("  Mode: FULL SYSTEM")
-        print("  (Audio spatialized by both vision and head movement)")
+        print("  Mode: AUDIO ONLY (no vision, no IMU)")
+    
+    # Display detection mode if vision is enabled
+    if enable_vision:
+        detection_mode_names = {1: "Both (animate + inanimate)", 2: "Inanimate only", 3: "Animate/person only"}
+        print(f"  Detection Mode: {args.detection_mode} - {detection_mode_names.get(args.detection_mode, 'Unknown')}")
     print()
 
     try:
         audio_files = ["drums.wav", "rain.wav"]
 
-        # Initialize audio engine (HRTF + IMU + Vision)
+        # Apply detection mode from command-line argument
+        if enable_vision:
+            VISION_CONFIG["detection_mode"] = args.detection_mode
+        
+        # Initialize audio engine (HRTF + optional IMU + optional Vision)
         processor = SpatialAudioProcessor(
             audio_files=audio_files,
             sofa_file="MIT_KEMAR_normal_pinna.sofa",
             sample_rate=44100,
-            imu_port=5005,
-            vision_config=VISION_CONFIG
+            imu_port=5005 if enable_imu else None,
+            vision_config=VISION_CONFIG if enable_vision else {}
         )
 
         # Ask user for mode
@@ -119,7 +152,10 @@ def main():
                 print("[MAIN] Starting vision (YOLO)...")
                 vision_thread = start_and_test_vision(processor)
             else:
-                print("[MAIN] Vision is DISABLED (audio only mode).")
+                print("[MAIN] Vision is DISABLED.")
+            
+            if not enable_imu:
+                print("[MAIN] IMU head-tracking is DISABLED.")
 
             # Simple interactive controls
             control_state = {"vision": vision_thread}
@@ -153,7 +189,7 @@ def main():
                             print(f"      Closing camera feed window.")
                     elif cmd == "v":
                         if not enable_vision:
-                            print("[CTRL] Vision is disabled (use without --vision-only to enable).")
+                            print("[CTRL] Vision is disabled (use --vision flag to enable).")
                             continue
                         vt = control_state.get("vision")
                         if vt is None or not vt.is_alive():

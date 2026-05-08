@@ -2,6 +2,34 @@
 # HRTF SPATIAL AUDIO MODULE
 # Head-tracked HRTF spatial audio with IMU support
 # ============================================================================
+#
+# INTERAURAL TIME DIFFERENCE (ITD) INTEGRATION NOTES:
+# ====================================================
+# ITD is the time difference between when sound reaches left vs right ear.
+# Used for azimuth localization at low frequencies (<1.5kHz).
+#
+# ITD Formula:
+#   ITD_seconds = (head_width_m * sin(azimuth_radians)) / speed_of_sound_m_s
+#   ITD_samples = ITD_seconds * sample_rate
+#
+# Typical parameters:
+#   - Head width: ~0.15-0.20m (human head)
+#   - Speed of sound: 343 m/s (at 20°C)
+#   - Azimuth range: -180° to +180° (left to right)
+#
+# Integration Points in This Code:
+# 1. In audio_callback(): After interpolating HRIR, add ITD delay to right channel
+# 2. In spatialize_audio_block(): Shift right ear convolution by ITD_samples
+# 3. Combine with HRTF: HRTF handles spectral cues, ITD handles timing cues
+#
+# Example implementation:
+#   itd_samples = int((0.175 * sin(azimuth_rad) / 343.0) * sample_rate)
+#   if itd_samples > 0:
+#       output_right = np.pad(output_right, (itd_samples, 0))[:len(output_left)]
+#   else:
+#       output_left = np.pad(output_left, (-itd_samples, 0))[:len(output_right)]
+#
+# ============================================================================
 
 import threading
 import time
@@ -296,8 +324,12 @@ class SpatialAudioProcessor:
         os.makedirs(debug_dir, exist_ok=True)
         self.logger = DebugLogger(debug_dir)
 
-        # Head tracking receiver
-        self.imu = HeadTrackingReceiver(port=imu_port, logger=self.logger)
+        # Head tracking receiver (only if IMU enabled)
+        self.imu = None
+        if imu_port is not None:
+            self.imu = HeadTrackingReceiver(port=imu_port, logger=self.logger)
+        else:
+            print("[HRTF] IMU head-tracking disabled")
 
         # Yaw/pitch filtering
         self.filtered_yaw = 0.0
@@ -328,13 +360,16 @@ class SpatialAudioProcessor:
             self.sources.append(source)
 
         # Phase 3: source states
+        # ✓ FIXED: Initialize last_update_t to current time so freshness check works from start
+        t_init = system_clock.now()
         self.source_states = [SourceState(
-            azimuth_deg=0.0,
+            azimuth_deg=float(src.azimuth),
             elevation_deg=0.0,
             distance_est=float(self.vision_config.get("distance_fixed_m", 1.4)),
             gain=1.0,
-            active=False,
-        ) for _ in self.sources]
+            active=True,  # Initialize active, but will be managed by vision tracking
+            last_update_t=t_init,
+        ) for src in self.sources]
 
         self._source_states_lock = threading.Lock()
 
@@ -382,7 +417,8 @@ class SpatialAudioProcessor:
         """
         Provide a camera/head-relative vision target with timing alignment.
         """
-        t = t_vision if t_vision is not None else time.time()
+        # ✓ FIXED: Use unified system clock for consistent timing
+        t = t_vision if t_vision is not None else system_clock.now()
         gate_th = float(self.vision_config.get("gate_conf_thres", 0.25))
         c = float(conf) if conf is not None else 0.0
         cname = str(cls_name) if cls_name is not None else ""
@@ -553,6 +589,14 @@ class SpatialAudioProcessor:
         conv_left = signal.fftconvolve(mono_block, hrir_l, mode='full')
         conv_right = signal.fftconvolve(mono_block, hrir_r, mode='full')
 
+        # TODO: Interaural Time Difference (ITD) Enhancement
+        # After convolution, apply ITD delay to right channel for improved localization:
+        #   itd_s = (0.175 * np.sin(np.radians(source.azimuth))) / 343.0
+        #   itd_samples = int(itd_s * self.sample_rate)
+        #   if itd_samples > 0:
+        #       conv_right = np.pad(conv_right, (itd_samples, 0))
+        #   This improves low-frequency (<1.5kHz) azimuth perception
+
         output_length = len(mono_block)
         output = np.zeros((output_length, 2), dtype=np.float32)
 
@@ -585,15 +629,20 @@ class SpatialAudioProcessor:
         if status:
             print(f"Audio status: {status}")
 
-        # RAW IMU angles
-        roll, pitch, yaw = self.imu.get_euler()
-        
-        # Apply YAW_SIGN for consistent convention
-        yaw_signed = YAW_SIGN * yaw
-
-        # Head-tracking mapping
-        target_yaw = self.yaw_gain * yaw_signed
-        target_pitch = self.pitch_gain * pitch
+        # RAW IMU angles (if IMU enabled)
+        if self.imu is not None:
+            roll, pitch, yaw = self.imu.get_euler()
+            # Apply YAW_SIGN for consistent convention
+            yaw_signed = YAW_SIGN * yaw
+            # Head-tracking mapping
+            target_yaw = self.yaw_gain * yaw_signed
+            target_pitch = self.pitch_gain * pitch
+        else:
+            # No IMU: use zero angles and ensure yaw_signed exists
+            roll, pitch, yaw = 0.0, 0.0, 0.0
+            yaw_signed = YAW_SIGN * yaw
+            target_yaw = 0.0
+            target_pitch = 0.0
 
         alpha = 0.3
         self.filtered_yaw = (1.0 - alpha) * self.filtered_yaw + alpha * target_yaw
@@ -604,12 +653,12 @@ class SpatialAudioProcessor:
         dist_for_audio = None
         gain_for_audio = 1.0
 
-        t_now = time.time()
+        # ✓ FIXED: Use unified system clock for consistent timing across all threads
+        t_now = system_clock.now()
 
         # First pass: collect fresh detection states (non-blocking read)
         fresh_detections = []
         source_states_snapshot = []
-        
         for i in range(len(self.sources)):
             with self._source_states_lock:
                 ss = self.source_states[i]
@@ -726,16 +775,20 @@ class SpatialAudioProcessor:
             print("Already playing")
             return
 
-        # Wait for IMU to send first packet before starting audio
-        print("⏳ Waiting for IMU initialization...")
-        timeout = time.time() + 3.0
-        while self.imu.t_send == 0.0 and time.time() < timeout:
-            time.sleep(0.05)
-        
-        if self.imu.t_send == 0.0:
-            print("⚠️  WARNING: IMU not responding (starting anyway)")
+        # Wait for IMU to send first packet before starting audio (if IMU enabled)
+        if self.imu is not None:
+            print("⏳ Waiting for IMU initialization...")
+            # ✓ FIXED: Use unified system clock for timeout
+            timeout = system_clock.now() + 3.0
+            while self.imu.t_send == 0.0 and system_clock.now() < timeout:
+                time.sleep(0.05)
+            
+            if self.imu.t_send == 0.0:
+                print("⚠️  WARNING: IMU not responding (starting anyway)")
+            else:
+                print("✅ IMU ready")
         else:
-            print("✅ IMU ready")
+            print("[HRTF] IMU disabled, starting audio without head-tracking")
         
         # Mark audio as ready
         self._audio_ready = True
