@@ -20,12 +20,13 @@ def parse_arguments():
         description="Multimodal Spatial Audio Toolkit - HRTF + Vision + Head-Tracking",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-COMBINATIONS:
+MODES:
 
-  python main.py                                Audio only (no vision, no IMU)
-  python main.py --vision                       Vision-only control
-  python main.py --imu                          IMU head-tracking only
-  python main.py --vision --imu                 Full system (vision + IMU head-tracking)
+    python main.py                                Full system (vision + IMU head-tracking)
+        python main.py --vision --detection-mode 1   Vision control for both animate + inanimate
+        python main.py --vision --detection-mode 2   Vision control for inanimate objects only
+        python main.py --vision --detection-mode 3   Vision control for animate/person only
+        python main.py --imu                          IMU-only audio control
 
 DETECTION MODES (for vision-based control):
 
@@ -35,9 +36,9 @@ DETECTION MODES (for vision-based control):
 
 EXAMPLES:
 
-  python main.py --vision --detection-mode 3   Vision control with person detection only
-  python main.py --vision --detection-mode 2   Vision control with furniture detection
-  python main.py --vision --imu                Full system with person + IMU detection
+    python main.py --vision --detection-mode 3   Vision control with person detection only
+    python main.py --vision --detection-mode 2   Vision control with furniture detection
+    python main.py --imu                         IMU-only audio control
 
 OFFLINE RENDER:
 
@@ -81,12 +82,11 @@ def main():
     
     # Determine which subsystems to enable
     # Audio engine always runs - it's the core component
-    # --vision: Enable vision
-    # --imu: Enable IMU head-tracking
-    # Default (no args): Audio only (vision and IMU disabled)
-    # --vision --imu: Full system
-    enable_vision = args.vision
-    enable_imu = args.imu
+    # Default (no args): Full system (vision and IMU enabled)
+    # --vision: vision-only control unless --imu is also supplied
+    # --imu: IMU-only control unless --vision is also supplied
+    enable_vision = args.vision or (not args.vision and not args.imu)
+    enable_imu = args.imu or (not args.vision and not args.imu)
     
     print("=" * 70)
     print("MULTIMODAL SPATIAL AUDIO TOOLKIT")
@@ -189,7 +189,7 @@ def main():
                             print(f"      Closing camera feed window.")
                     elif cmd == "v":
                         if not enable_vision:
-                            print("[CTRL] Vision is disabled (use --vision flag to enable).")
+                            print("[CTRL] Vision is disabled (use --vision to enable).")
                             continue
                         vt = control_state.get("vision")
                         if vt is None or not vt.is_alive():

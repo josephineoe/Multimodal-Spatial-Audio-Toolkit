@@ -1,3 +1,22 @@
+# 2026-05-08 - Correct CLI modes to match requested usage
+
+### Summary
+Updated `main.py` so the CLI matches the requested three modes: `python main.py` starts the full system, `python main.py --vision --detection-mode N` runs vision-based control, and `python main.py --imu` runs IMU-only audio control.
+
+### Changes Made
+
+#### 1. **CLI Mode Alignment** (main.py)
+- Restored `--vision` as the vision-control flag
+- Restored `--imu` as the IMU-control flag
+- Kept full-system startup as the default when no flags are provided
+- Updated help text and examples to match the intended usage
+
+#### 2. **Runtime Messaging** (main.py)
+- Updated the disabled-vision control message to reference `--vision`
+
+### Files Modified
+- main.py (CLI mode logic, help text, control-loop message)
+
 # 2026-05-08 - Implement object ID to source index mapping for multi-object tracking
 
 ### Summary
